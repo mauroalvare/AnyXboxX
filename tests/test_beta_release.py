@@ -69,6 +69,45 @@ def test_conflict_reports_the_path_and_leaves_no_integration_branch(repo, monkey
     assert git(repo, "rev-parse", "HEAD") == fork
 
 
+def test_pinned_topics_report_all_conflicts_and_block_integration(repo):
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, "second.txt", "upstream\n")
+    upstream = commit(repo, "shared file.txt", "upstream\n")
+    git(repo, "switch", "--quiet", "-c", "perf/topic-one", base)
+    first = commit(repo, "shared file.txt", "topic one\n")
+    git(repo, "switch", "--quiet", "-c", "perf/topic-two", base)
+    second = commit(repo, "second.txt", "topic two\n")
+    git(repo, "switch", "--quiet", "optimizations")
+    (repo / ".github").mkdir()
+    fork = commit(repo, ".github/beta-optimization-topics.txt",
+                  f"{first} perf/topic-one\n{second} perf/topic-two\n")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "integrate", upstream, fork, "beta/integration-321-1"],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 1
+    assert "perf/topic-one\n  'shared file.txt'" in result.stderr
+    assert "perf/topic-two\n  'second.txt'" in result.stderr
+    assert git(repo, "branch", "--list", "beta/*") == ""
+
+
+def test_integration_keeps_the_topic_at_its_pinned_commit(repo):
+    base = git(repo, "rev-parse", "HEAD")
+    upstream = commit(repo, "upstream.txt", "upstream\n")
+    git(repo, "switch", "--quiet", "-c", "perf/topic", base)
+    pin = commit(repo, "topic.txt", "pinned optimization\n")
+    commit(repo, "topic.txt", "new branch tip\n")
+    git(repo, "switch", "--quiet", "optimizations")
+    (repo / ".github").mkdir()
+    fork = commit(repo, ".github/beta-optimization-topics.txt", f"{pin} perf/topic\n")
+
+    sha = integrate(repo, upstream, fork, "beta/integration-321-1")
+
+    assert git(repo, "show", f"{sha}:topic.txt") == "pinned optimization"
+
+
 def test_package_contains_only_the_release_files_and_exact_revisions(repo):
     head = git(repo, "rev-parse", "HEAD")
     revisions = {"upstream": "a" * 40, "optimizations": "b" * 40, "integration": head}

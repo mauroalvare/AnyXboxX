@@ -59,6 +59,7 @@ jobs:
     env:
       ANYXBOXX_REQUIRE_RUNTIME: "1"
       ANYXBOXX_GPU: warp
+      VICTORY_D3D12_WARP: "1"
       CARGO_PROFILE_RELEASE_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     outputs:

@@ -7,6 +7,6 @@ French version in [docs/fr/versions-beta.md](fr/versions-beta.md).
 3. Open [Releases](https://github.com/mauroalvare/AnyXboxX/releases) after the run succeeds. Under **Assets** of the new `beta-…` pre-release, download `AnyXboxX-windows-x64.zip`. The release notes and `revisions.json` in the ZIP give the two input SHAs and the tested commit.
 4. Extract the ZIP, run `Play-AnyXboxX.cmd`, and select the folder with your own game copy. See the [Windows requirements](running-gta6.md#requirements).
 
-If integration fails, open **Summary** on the Actions run for the conflicting paths. Merge upstream `main` into `beta/optimizations` in your checkout, resolve the listed paths and push the result, then start a new run.
+If integration fails, open **Summary** on the Actions run for the conflicting paths. Merge upstream `main` into `beta/optimizations` in your checkout, resolve the listed paths and push the result, then start a new run. The starting branch also pins outstanding optimization topics in `.github/beta-optimization-topics.txt`. For a conflict reported under a topic name, merge that pinned commit into `beta/optimizations`, resolve the paths, and remove the corresponding entry once the commit is included.
 
 GitHub may reject the integration branch push when upstream introduces workflow files that are new to the fork. In that case, set the fork's `BETA_INTEGRATION_TOKEN` Actions secret to a fine-grained token scoped to this fork with write access to **Contents** and **Workflows**. The final release uses the Actions token.
