@@ -1,0 +1,164 @@
+name: Windows x64 beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: LooperSalty/AnyXboxX
+  OPTIMIZATIONS_BRANCH: beta/optimizations
+
+jobs:
+  integrate:
+    if: github.repository == 'mauroalvare/AnyXboxX' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      upstream: ${{ steps.merge.outputs.upstream }}
+      optimizations: ${{ steps.merge.outputs.optimizations }}
+      integration: ${{ steps.merge.outputs.integration }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BETA_INTEGRATION_TOKEN || github.token }}
+      - name: Integrate upstream main and the optimization branch
+        id: merge
+        shell: bash
+        run: |
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" refs/heads/main
+          upstream=$(git rev-parse FETCH_HEAD)
+          git fetch --no-tags origin "refs/heads/$OPTIMIZATIONS_BRANCH"
+          optimizations=$(git rev-parse FETCH_HEAD)
+          branch="beta/integration-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          integration=$(python3 tools/beta_release.py integrate "$upstream" "$optimizations" "$branch")
+          git push origin "refs/heads/$branch"
+          {
+            echo "upstream=$upstream"
+            echo "optimizations=$optimizations"
+            echo "integration=$integration"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "Integration branch \`$branch\`"
+            echo "- Upstream \`$upstream\`"
+            echo "- Optimizations \`$optimizations\`"
+            echo "- Integration \`$integration\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: integrate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: source
+    env:
+      ANYXBOXX_REQUIRE_RUNTIME: "1"
+      ANYXBOXX_GPU: warp
+      VICTORY_D3D12_WARP: "1"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.integrate.outputs.integration }}
+          path: source
+          submodules: true
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: release-tools
+          sparse-checkout: tools/beta_release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt ruff
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Lint
+        run: python -m ruff check --select W605,F,E9 PrototypeScarlett tests tools
+      - name: Check VIctory asset policy
+        working-directory: source/third_party/victory
+        run: cargo xtask policy
+      - name: Build Rust workspace
+        run: cargo build --locked --release --workspace
+      - name: Build C++ runtime
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S runtime -B runtime/build -A x64
+          cmake --build runtime/build --config Release
+      - name: Build TomBox runtime for tests
+        run: python tools/build_tombox.py
+      - name: Build VIctory
+        working-directory: source/third_party/victory
+        run: cargo build --locked --release -p victory --features diagnostics
+      - name: Run Python tests
+        run: python -m pytest -n auto
+      - name: Run Rust tests
+        run: cargo test --locked --release --workspace
+      - name: Run VIctory tests
+        working-directory: source/third_party/victory
+        run: cargo test --locked --release --workspace --features diagnostics
+      - name: Package Windows x64
+        id: package
+        env:
+          UPSTREAM_SHA: ${{ needs.integrate.outputs.upstream }}
+          OPTIMIZATIONS_SHA: ${{ needs.integrate.outputs.optimizations }}
+          INTEGRATION_SHA: ${{ needs.integrate.outputs.integration }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          & ./target/release/anyxboxx.exe run --help
+          & ./third_party/victory/target/release/victory.exe --help
+          python ../release-tools/tools/beta_release.py package . ../AnyXboxX-windows-x64.zip `
+            $env:UPSTREAM_SHA $env:OPTIMIZATIONS_SHA $env:INTEGRATION_SHA
+          "artifact=windows-x64-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: |
+            AnyXboxX-windows-x64.zip
+            AnyXboxX-windows-x64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [integrate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.integrate.outputs.upstream }}
+          OPTIMIZATIONS_SHA: ${{ needs.integrate.outputs.optimizations }}
+          INTEGRATION_SHA: ${{ needs.integrate.outputs.integration }}
+        shell: bash
+        run: |
+          sha256sum --check AnyXboxX-windows-x64.zip.sha256
+          tag="beta-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cat > release-notes.md <<EOF
+          Windows x64 beta. Extract the ZIP and run Play-AnyXboxX.cmd.
+
+          - [Upstream main \`$UPSTREAM_SHA\`]($GITHUB_SERVER_URL/$UPSTREAM/commit/$UPSTREAM_SHA)
+          - [Fork optimizations \`$OPTIMIZATIONS_SHA\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$OPTIMIZATIONS_SHA)
+          - [Tested integration commit \`$INTEGRATION_SHA\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$INTEGRATION_SHA)
+          - [Build and tests]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)
+          EOF
+          url=$(gh release create "$tag" AnyXboxX-windows-x64.zip AnyXboxX-windows-x64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" --target "$INTEGRATION_SHA" --prerelease --latest=false \
+            --title "Windows x64 $tag" --notes-file release-notes.md)
+          echo "[Download $tag]($url)" >> "$GITHUB_STEP_SUMMARY"
