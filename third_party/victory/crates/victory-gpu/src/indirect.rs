@@ -437,7 +437,8 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let need_uav = !list.list.is_uav_synced();
+    let recorded = record_clamp_with_uav(c, &list.list, (dst, before), budget, src, count, spec, ahead, need_uav);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -459,6 +460,21 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+) -> bool {
+    record_clamp_with_uav(c, l, (dst, before), budget, (src, src_offset), count, (kind, stride, records), ahead, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_with_uav(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+    need_pre_uav: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -522,18 +538,19 @@ fn record_clamp_as(
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
+    // Transitioning `dst` from UNORDERED_ACCESS -> INDIRECT_ARGUMENT already
+    // orders the clamp's writes to `dst` before ExecuteIndirect reads it; the
+    // only other UAV written (`budget`) is read by the next clamp after its
+    // own pre-barrier (same as `batch::record`).
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
+    let skip_first = usize::from(!(waits && need_pre_uav));
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -544,7 +561,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second);
     }
     true
 }
@@ -600,7 +617,8 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    let need_uav = !list.list.is_uav_synced();
+    batch::record_with_uav(c, &list.list, (&dst, before), budget, sources, jobs, need_uav);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
