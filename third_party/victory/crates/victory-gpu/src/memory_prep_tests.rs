@@ -396,8 +396,6 @@ impl Drop for TitleRegion {
     }
 }
 
-static PREP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Writes synthetic TLAS instance records (128 bytes each, BLAS 40-bit address
 /// in the last 8 bytes, matching `Memory::named_in_upload`) into an `Upload`
 /// block.
@@ -414,7 +412,7 @@ fn fill_tlas_upload(upload: &mut crate::upload::Upload, blas_addrs: &[u64]) -> u
 
 #[test]
 fn synthetic_bvh_prep_fast_path_tlas_replace_and_sweep_on_gpu() {
-    let _guard = PREP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = fresh_test_memory();
     let Some(host) = host() else { return };
     if !crate::shadow::cards() || !host.card_ready() {
         return;
@@ -718,7 +716,7 @@ fn synthetic_bvh_prep_fast_path_tlas_replace_and_sweep_on_gpu() {
 #[test]
 #[ignore = "GPU benchmark (run with --release --features diagnostics -- --exact --ignored --nocapture --test-threads=1)"]
 fn bench_bvh_prep_and_tlas_sustained() {
-    let _guard = PREP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = fresh_test_memory();
     let Some(host) = host() else {
         panic!("no host GPU available");
     };

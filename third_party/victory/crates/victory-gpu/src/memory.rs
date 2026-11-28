@@ -365,6 +365,16 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The synthetic titles share the same GPU memory manager. Each needs a fresh
+/// directory because Windows can reuse the virtual addresses from a prior test.
+#[cfg(test)]
+fn fresh_test_memory() -> std::sync::MutexGuard<'static, ()> {
+    static TEST: Mutex<()> = Mutex::new(());
+    let guard = TEST.lock().unwrap_or_else(|e| e.into_inner());
+    *MEMORY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    guard
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,

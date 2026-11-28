@@ -549,8 +549,6 @@ impl Drop for TitleRegion {
     }
 }
 
-static LOCALITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn arena_bitmap_contiguous_run_and_reclaim() {
     let base = 0x2_0000_0000usize;
@@ -590,7 +588,7 @@ fn arena_bitmap_contiguous_run_and_reclaim() {
 
 #[test]
 fn synthetic_bvh_arena_locality_packing_move_remove_and_lifetime_on_gpu() {
-    let _guard = LOCALITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = fresh_test_memory();
     let Some(host) = host() else { return };
     if !crate::shadow::cards() || !host.card_ready() {
         return;
@@ -860,7 +858,7 @@ fn synthetic_bvh_arena_locality_packing_move_remove_and_lifetime_on_gpu() {
 #[test]
 #[ignore = "GPU benchmark (run with --release --features diagnostics -- --exact --ignored --nocapture --test-threads=1)"]
 fn bench_bvh_arena_locality_sustained() {
-    let _guard = LOCALITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = fresh_test_memory();
     let Some(host) = host() else {
         panic!("no host GPU available");
     };

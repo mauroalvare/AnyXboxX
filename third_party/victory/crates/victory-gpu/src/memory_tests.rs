@@ -389,9 +389,6 @@ impl Drop for TitleRegion {
     }
 }
 
-/// Serializes GPU memory tests in one process since `MEMORY` is global.
-static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Lets the test change scene state while an earlier GPU submission is pending.
 struct QueueBlock(ID3D12Fence);
 
@@ -451,7 +448,7 @@ fn run_trace(
 /// Set `VICTORY_MEMORY_CARD_MB=0` to exercise the shared-memory fallback.
 #[test]
 fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
-    let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = fresh_test_memory();
     let Some(host) = host() else { return };
     let card_memory = crate::shadow::cards() && host.card_ready();
     let adapter = victory_shader::emit::host::Host { device: host.device.clone() }.adapter_name();
@@ -692,7 +689,7 @@ fn bvh_benchmark_summary_uses_median_and_nearest_rank_p95() {
 #[test]
 #[ignore = "GPU benchmark (run with --release -- --ignored --nocapture --test-threads=1)"]
 fn bench_bvh_static_and_dynamic_sustained() {
-    let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = fresh_test_memory();
     let Some(host) = host() else {
         panic!("no host GPU available");
     };

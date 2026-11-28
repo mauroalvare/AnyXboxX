@@ -223,7 +223,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some(p.left_out.unwrap_or("being made").into()),
+        None => Some("being made".into()),
         Some(None) => {
             let rejected = unsupported_stages(p.shaders.iter().map(|s| s.stage), p.graphics.is_some());
             if let Some(reason) = rejected.filter(|reason| *reason != "graphics state not kept (plain description)") {
@@ -678,10 +678,12 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn missing_distinguishes_omitted_and_pending_pipelines() {
-        let reason = "ray activation shader without BVH, left out";
         let mut omitted = Pending::new(Vec::new(), None);
-        omitted.left_out = Some(reason);
-        assert_eq!(missing(&omitted).as_deref(), Some(reason));
+        omitted.left_out = Some("ray activation shader without BVH, left out");
+        assert_eq!(
+            missing(&omitted).as_deref(),
+            Some("intentionally omitted: ray activation shader without BVH, left out")
+        );
 
         let pending = Pending::new(Vec::new(), None);
         pending.queue_state.store(MAKING, Ordering::Relaxed);
@@ -868,14 +870,4 @@ mod tests {
         assert!(builder_no_activate.check(false, true).is_some());
     }
 
-    #[cfg(feature = "diagnostics")]
-    #[test]
-    fn missing_reports_left_out_reason_instead_of_being_made() {
-        let mut p = Pending::new(Vec::new(), None);
-        p.left_out = Some("ray activation shader without BVH, left out");
-        assert_eq!(
-            missing(&p).as_deref(),
-            Some("ray activation shader without BVH, left out")
-        );
-    }
 }
