@@ -1,7 +1,7 @@
 # Xbox2Windows : retarget du DXIL console (copie)
 
 Fichiers copiés **sans modification** depuis [R0Y00/Xbox2Windows](https://github.com/R0Y00/Xbox2Windows),
-commit `708f4ab` (23 novembre 2026, 15 h). Licence : MIT (fichier `LICENSE`). Tout le mérite de ce code
+commit `0fe4ceb` (28 novembre 2026, 4 h). Licence : MIT (fichier `LICENSE`). Tout le mérite de ce code
 revient aux contributeurs de Xbox2Windows.
 
 | Fichier | Rôle |

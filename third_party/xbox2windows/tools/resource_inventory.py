@@ -5,11 +5,13 @@ from collections import Counter
 import hashlib
 import json
 import mmap
+import os
 from pathlib import Path
 import re
 import struct
 import subprocess
-from tempfile import NamedTemporaryFile
+import tempfile
+import xml.etree.ElementTree as ET
 import zlib
 
 from verify_build import read_layout
@@ -198,36 +200,59 @@ def scene_records(data, validator=None, *, observe=None):
             "validator_samples": len(samples), "first_per_stage": samples}
 
 
-def main():
+def _write_atomic_json(output: Path, report: dict) -> None:
+    if output.is_dir():
+        raise IsADirectoryError(f"output path is a directory: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=f".{output.name}.") as tmp_dir:
+        tmp_path = Path(tmp_dir) / output.name
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp_path, output)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--shader-control", type=Path)
     parser.add_argument("--scene-records", action="store_true", help="Inspect compressed records in shaders.rpf")
     parser.add_argument("--scene-validator", type=Path, help="Use the built root_probe.exe on one container per stage")
-    args = parser.parse_args()
-    root = args.directory.resolve(strict=True)
-    layouts = [path for path in root.glob("layout*.xml") if path.is_file()]
+    args = parser.parse_args(argv)
+    try:
+        root = args.directory.resolve(strict=True)
+        if not root.is_dir():
+            raise NotADirectoryError(f"not a directory: {root}")
+        layouts = [path for path in sorted(root.glob("layout*.xml")) if path.is_file()]
+    except OSError as exc:
+        parser.exit(1, f"resource_inventory: {exc}\n")
     if len(layouts) != 1:
         parser.error(f"expected exactly one layout*.xml file in {root}, found {len(layouts)}")
     layout, = layouts
-    markers, targets = read_layout(layout)
+    try:
+        markers, targets = read_layout(layout)
+    except (OSError, ET.ParseError, KeyError) as exc:
+        parser.exit(1, f"resource_inventory: {exc}\n")
     rows = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.suffix.lower() == ".torrent":
-            continue
-        with path.open("rb") as stream:
-            header = stream.read(1024)
-        name = path.relative_to(root).as_posix()
-        row = {"path": name, "bytes": path.stat().st_size, "chunks": targets.get(name, []),
-               "prefix_hex": header[:8].hex(), "signature": signature(header)}
-        if row["signature"] == "PE" and path.suffix.lower() == ".bin":
-            pe_offset, = struct.unpack_from("<I", header, 60)
-            if pe_offset + 44 <= len(header):
-                machine, sections = struct.unpack_from("<HH", header, pe_offset + 4)
-                row["pe_machine"] = hex(machine)
-                row["pe_sections"] = sections
-                row["pe_entry_rva"], = struct.unpack_from("<I", header, pe_offset + 40)
-        rows.append(row)
+    try:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() == ".torrent":
+                continue
+            with path.open("rb") as stream:
+                header = stream.read(1024)
+            name = path.relative_to(root).as_posix()
+            row = {"path": name, "bytes": path.stat().st_size, "chunks": targets.get(name, []),
+                   "prefix_hex": header[:8].hex(), "signature": signature(header)}
+            if row["signature"] == "PE" and path.suffix.lower() == ".bin":
+                pe_offset, = struct.unpack_from("<I", header, 60)
+                if pe_offset + 44 <= len(header):
+                    machine, sections = struct.unpack_from("<HH", header, pe_offset + 4)
+                    row["pe_machine"] = hex(machine)
+                    row["pe_sections"] = sections
+                    row["pe_entry_rva"], = struct.unpack_from("<I", header, pe_offset + 40)
+            rows.append(row)
+    except (OSError, struct.error) as exc:
+        parser.exit(1, f"resource_inventory: {exc}\n")
     available = {r["path"] for r in rows}
     chunks = {}
     for chunk, marker in markers.items():
@@ -236,14 +261,25 @@ def main():
                          "present_bytes": sum(r["bytes"] for r in rows if chunk in r["chunks"]),
                          "missing": sorted(set(files) - available)}
     control = None
-    if args.shader_control:
-        data = args.shader_control.read_bytes()
-        control = {"file": args.shader_control.name, "sha256": hashlib.sha256(data).hexdigest(),
-                   "markers": shader_markers(data)}
-        if not control["markers"]["framed_dxil_programs"]:
-            raise ValueError("Positive control has no structurally recognizable DXIL program")
-    focus = {name: probe_archive(root / name) for name in ("appdata0.rpf", "common.rpf", "shaders.rpf")
-             if name in available}
+    if args.shader_control is not None:
+        control_path = args.shader_control
+        try:
+            if control_path.is_dir():
+                raise IsADirectoryError(f"shader control is a directory: {control_path}")
+            if not control_path.is_file():
+                raise FileNotFoundError(f"shader control not found: {control_path}")
+            data = control_path.read_bytes()
+            control = {"file": control_path.name, "sha256": hashlib.sha256(data).hexdigest(),
+                       "markers": shader_markers(data)}
+            if not control["markers"]["framed_dxil_programs"]:
+                raise ValueError("Positive control has no structurally recognizable DXIL program")
+        except (OSError, ValueError) as exc:
+            parser.exit(1, f"resource_inventory: {exc}\n")
+    try:
+        focus = {name: probe_archive(root / name) for name in ("appdata0.rpf", "common.rpf", "shaders.rpf")
+                 if name in available}
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"resource_inventory: {exc}\n")
     report = {
         "build": root.name, "layout": layout.name, "chunks": chunks,
         "signature_counts": dict(Counter(r["signature"] for r in rows)), "files": rows,
@@ -252,25 +288,39 @@ def main():
         "probe_scope": "Raw marker search covers the three entire archives. Sample up to 8 checksum-valid zlib streams at 16-byte aligned 78xx headers in first 4 MiB; limits 512 KiB input and 2 MiB output per candidate. No inference about remaining encoded content.",
         "positive_control": control, "archive_probes": focus,
     }
-    if args.scene_records or args.scene_validator:
-        with (root / "shaders.rpf").open("rb") as stream:
-            if stream.seek(0, 2):
-                with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                    report["scene_records"] = scene_records(data, args.scene_validator)
-            else:
-                report["scene_records"] = scene_records(b"")
+    if args.scene_records or args.scene_validator is not None:
+        shaders_rpf = root / "shaders.rpf"
+        validator = args.scene_validator
+        try:
+            if validator is not None:
+                if validator.is_dir():
+                    raise IsADirectoryError(f"scene validator is a directory: {validator}")
+                if not validator.is_file():
+                    raise FileNotFoundError(f"scene validator not found: {validator}")
+            if shaders_rpf.is_dir():
+                raise IsADirectoryError(f"shaders.rpf is a directory: {shaders_rpf}")
+            if not shaders_rpf.is_file():
+                raise FileNotFoundError(f"missing shaders.rpf in {root}")
+            with shaders_rpf.open("rb") as stream:
+                if stream.seek(0, 2):
+                    with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                        report["scene_records"] = scene_records(data, validator)
+                else:
+                    report["scene_records"] = scene_records(b"", validator)
+        except (OSError, ValueError, KeyError, struct.error, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            parser.exit(1, f"resource_inventory: {exc}\n")
     output = Path(__file__).resolve().parents[1] / "out" / "resources" / (root.name + ".json")
-    if output.resolve().is_relative_to(root):
-        raise ValueError("Resource report must be outside the game directory")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(dir=output.parent, mode="w", encoding="utf-8", delete=False) as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    Path(f.name).replace(output)
+    try:
+        if output.resolve().is_relative_to(root):
+            raise ValueError("Resource report must be outside the game directory")
+        _write_atomic_json(output, report)
+    except (OSError, ValueError, TypeError) as exc:
+        parser.exit(1, f"resource_inventory: {exc}\n")
     print(f"{len(chunks)} chunks | {len(rows)} files | {output}")
     for name, probe in focus.items():
         print(name, probe["raw_markers"], "sampled zlib streams", len(probe["sample_streams"]))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

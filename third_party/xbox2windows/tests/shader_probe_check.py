@@ -16,6 +16,10 @@ VALID = {"call_hr": "0x00000000", "status": "0x00000000"}
 
 
 def file_version(path):
+    path = Path(path)
+    # A DXC without a separate dxil.dll validates in dxcompiler.dll, as root_probe does.
+    if path.name.lower() == "dxil.dll" and not path.exists():
+        path = path.with_name("dxcompiler.dll")
     with pefile.PE(str(path), fast_load=True) as pe:
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
         info = pe.VS_FIXEDFILEINFO[0]

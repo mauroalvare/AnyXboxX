@@ -38,6 +38,10 @@ ENC_ARRAY = 3
 ENC_CHAR6 = 4
 ENC_BLOB = 5
 
+# Real modules nest blocks a handful of levels deep; the limit only stops hostile nesting from
+# exhausting the interpreter stack.
+MAX_BLOCK_DEPTH = 32
+
 CHAR6_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._"
 CHAR6_INDEX = {ord(ch): idx for idx, ch in enumerate(CHAR6_ALPHABET)}
 
@@ -187,6 +191,10 @@ def _read_abbrev_record(reader: BitReader, ops: list[tuple]) -> tuple[int, list[
             if idx + 1 >= len(ops):
                 raise ValueError("Array abbreviation missing element encoding")
             count = reader.read_vbr(6)
+            # Every element takes at least one bit, except a zero-width one, which would otherwise
+            # let a few bytes ask for billions of values.
+            if count > reader.nbits - reader.bitpos:
+                raise ValueError("Array length exceeds the remaining bitcode stream")
             idx += 1
             elem_kind, elem_data = ops[idx]
             for _ in range(count):
@@ -224,7 +232,10 @@ def parse_bitcode_block(
     end_bit: int,
     blockinfo_abbrevs: dict[int, list[list[tuple]]],
     recurse_ids: set[int],
+    depth: int = 0,
 ) -> list[tuple]:
+    if depth > MAX_BLOCK_DEPTH:
+        raise ValueError(f"LLVM bitcode blocks nest deeper than {MAX_BLOCK_DEPTH} levels")
     abbrevs = list(blockinfo_abbrevs.get(block_id, ()))
     current_bi_block = None
     items = []
@@ -247,10 +258,10 @@ def parse_bitcode_block(
             if sub_end > len(reader.data) or sub_end * 8 > end_bit:
                 raise ValueError("Subblock extends past parent bitcode block")
             if sub_id == BLOCKINFO_BLOCK_ID:
-                parse_bitcode_block(reader, BLOCKINFO_BLOCK_ID, sub_aw, sub_end * 8, blockinfo_abbrevs, set())
+                parse_bitcode_block(reader, BLOCKINFO_BLOCK_ID, sub_aw, sub_end * 8, blockinfo_abbrevs, set(), depth + 1)
                 items.append(("RAW_BLOCK", sub_id, sub_aw, reader.data[sub_start:sub_end]))
             elif sub_id in recurse_ids:
-                sub_items = parse_bitcode_block(reader, sub_id, sub_aw, sub_end * 8, blockinfo_abbrevs, recurse_ids)
+                sub_items = parse_bitcode_block(reader, sub_id, sub_aw, sub_end * 8, blockinfo_abbrevs, recurse_ids, depth + 1)
                 items.append(("BLOCK", sub_id, sub_aw, sub_items))
             else:
                 items.append(("RAW_BLOCK", sub_id, sub_aw, reader.data[sub_start:sub_end]))
@@ -641,6 +652,35 @@ def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = Fals
     return pso
 
 
+def export_compute_catalogue_entry(directory: Path, original: bytes, desktop: bytes,
+                                   entry: dict) -> Path | None:
+    """Publish one signed desktop compute shader under its original byte digest."""
+    from xbox_intrinsic_gate import ALLOW
+
+    status = entry["after"]
+    if (not entry["signed"] or entry["gate"]["verdict"] != ALLOW or
+        status["triple"] != DESKTOP_TRIPLE or
+        (status["container_status"], status["module_status"]) != ("0x00000000", "0x00000000") or
+        len(desktop) < 32 or desktop[:4] != b"DXBC" or not any(desktop[4:20])):
+        return None
+    chunks = parts(desktop)
+    version, *_ = unpack_dxil_program(chunks[b"DXIL"])
+    if version >> 16 != 5 or b"RTS0" not in chunks:
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{hashlib.sha256(original).hexdigest()}.dxil"
+    temporary = None
+    try:
+        with NamedTemporaryFile(dir=directory, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(desktop)
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
+
+
 def validate_pe_containers(
     pe_path: Path,
     probe: Path,
@@ -654,6 +694,7 @@ def validate_pe_containers(
     sign: bool = False,
     pso_probe: Path | None = None,
     warp_only: bool = False,
+    catalogue_dir: Path | None = None,
 ) -> dict:
     """Extract DXBC containers from a PE image, retarget selected DXIL modules, and validate via root_probe."""
     import pefile
@@ -745,6 +786,9 @@ def validate_pe_containers(
             }
             if pso_result is not None:
                 entry["pso"] = pso_result
+            if catalogue_dir is not None:
+                exported = export_compute_catalogue_entry(catalogue_dir, blob, retargeted_blob, entry)
+                entry["catalogue_file"] = str(exported) if exported is not None else None
             results.append(entry)
 
     report = {
@@ -760,6 +804,8 @@ def validate_pe_containers(
         "gate_rejected": sum(r["gate"]["verdict"] == "REJECT" for r in results),
         "entries": results,
     }
+    if catalogue_dir is not None:
+        report["catalogue_entries"] = len({r["catalogue_file"] for r in results if r["catalogue_file"]})
     if pso_probe is not None:
         report["pso_refused"] = sum(
             r.get("pso", {}).get("gate", {}).get("verdict") == "REJECT" for r in results
@@ -774,43 +820,17 @@ def validate_pe_containers(
     return report
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", nargs="?", type=Path, help="Input DXBC container or raw DXIL bitcode file")
-    parser.add_argument("output", nargs="?", type=Path, help="Output file path")
-    parser.add_argument("--pe", type=Path, help="Extract, retarget, and validate containers embedded in a PE image")
-    parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
-    parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
-    parser.add_argument("--only-without-xbox-calls", action="store_true",
-                        help="In --pe mode, process only DXIL modules that neither call nor otherwise "
-                             "reach an xbox.* symbol")
-    parser.add_argument("--source-triple", default=SOURCE_TRIPLE,
-                        help=f"Source target triple to match (default: {SOURCE_TRIPLE}; '*' matches any)")
-    parser.add_argument("--target-triple", default=DESKTOP_TRIPLE,
-                        help=f"Replacement target triple (default: {DESKTOP_TRIPLE})")
-    parser.add_argument("--drop-metadata", action="append", default=None,
-                        help="Named metadata to remove (repeatable; default: xbox.compiler.options)")
-    parser.add_argument("--keep-root-flags", action="store_true",
-                        help="Leave RTS0 flags unmodified instead of clearing Xbox flags 0x03000000")
-    parser.add_argument("--extract-module", action="store_true",
-                        help="Write bare retargeted DXIL bitcode instead of a DXBC container")
-    parser.add_argument("--probe", type=Path, help="Optional root_probe.exe path to validate or sign the output")
-    parser.add_argument("--sign", action="store_true",
-                        help="Re-sign retargeted DXBC containers with dxil.dll via --probe")
-    parser.add_argument("--pso-probe", type=Path,
-                        help="Optional root_device_probe.exe path to test CreateComputePipelineState")
-    parser.add_argument("--warp-only", action="store_true",
-                        help="Use only the WARP adapter with --pso-probe")
-    args = parser.parse_args()
-
+def _run_cli(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if not args.pe:
-        for dead in ("--output-dir", "--report", "--only-without-xbox-calls"):
+        for dead in ("--output-dir", "--catalogue-dir", "--report", "--only-without-xbox-calls"):
             if getattr(args, dead[2:].replace("-", "_")):
                 parser.error(f"{dead} requires --pe")
     elif args.extract_module:
         parser.error("--extract-module does not apply to --pe")
     if args.sign and not args.probe:
         parser.error("--sign requires --probe")
+    if args.catalogue_dir and not args.sign:
+        parser.error("--catalogue-dir requires --sign")
     if args.sign and args.extract_module:
         parser.error("--sign cannot be combined with --extract-module")
     if args.pso_probe and args.extract_module:
@@ -837,6 +857,7 @@ def main() -> int:
             sign=args.sign,
             pso_probe=args.pso_probe.resolve(strict=True) if args.pso_probe else None,
             warp_only=args.warp_only,
+            catalogue_dir=args.catalogue_dir,
         )
         if args.report:
             dest = args.report.resolve()
@@ -941,8 +962,43 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Parse CLI arguments and run dxil_retarget, reporting OSError/ValueError cleanly."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", type=Path, help="Input DXBC container or raw DXIL bitcode file")
+    parser.add_argument("output", nargs="?", type=Path, help="Output file path")
+    parser.add_argument("--pe", type=Path, help="Extract, retarget, and validate containers embedded in a PE image")
+    parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
+    parser.add_argument("--catalogue-dir", type=Path,
+                        help="Export signed, validated desktop compute containers by input SHA-256 in --pe mode")
+    parser.add_argument("--report", type=Path, help="Optional JSON report path in --pe mode")
+    parser.add_argument("--only-without-xbox-calls", action="store_true",
+                        help="In --pe mode, process only DXIL modules that neither call nor otherwise "
+                             "reach an xbox.* symbol")
+    parser.add_argument("--source-triple", default=SOURCE_TRIPLE,
+                        help=f"Source target triple to match (default: {SOURCE_TRIPLE}; '*' matches any)")
+    parser.add_argument("--target-triple", default=DESKTOP_TRIPLE,
+                        help=f"Replacement target triple (default: {DESKTOP_TRIPLE})")
+    parser.add_argument("--drop-metadata", action="append", default=None,
+                        help="Named metadata to remove (repeatable; default: xbox.compiler.options)")
+    parser.add_argument("--keep-root-flags", action="store_true",
+                        help="Leave RTS0 flags unmodified instead of clearing Xbox flags 0x03000000")
+    parser.add_argument("--extract-module", action="store_true",
+                        help="Write bare retargeted DXIL bitcode instead of a DXBC container")
+    parser.add_argument("--probe", type=Path, help="Optional root_probe.exe path to validate or sign the output")
+    parser.add_argument("--sign", action="store_true",
+                        help="Re-sign retargeted DXBC containers with dxil.dll via --probe")
+    parser.add_argument("--pso-probe", type=Path,
+                        help="Optional root_device_probe.exe path to test CreateComputePipelineState")
+    parser.add_argument("--warp-only", action="store_true",
+                        help="Use only the WARP adapter with --pso-probe")
+    args = parser.parse_args(argv)
     try:
-        sys.exit(main())
+        return _run_cli(args, parser)
     except (OSError, ValueError) as exc:
-        sys.exit(f"{Path(__file__).name}: {exc}")
+        print(f"{Path(__file__).name}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

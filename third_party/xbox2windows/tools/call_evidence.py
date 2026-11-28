@@ -2,12 +2,15 @@
 
 import argparse
 from collections import defaultdict
+from collections.abc import Sequence
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
 import subprocess
+import tempfile
 
 import pefile
 
@@ -95,10 +98,11 @@ def inspect(path):
         base = pe.OPTIONAL_HEADER.ImageBase
         memory, branches = instruction_refs(path, base)
         calls = {}
-        for desc in pe.DIRECTORY_ENTRY_IMPORT:
-            for imp in desc.imports:
-                name = imp.name.decode("ascii") if imp.name else ""
-                if (desc.dll.decode("ascii").lower(), name) not in EXPERIMENTS:
+        for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", None) or ():
+            dll = desc.dll.decode("ascii", "replace").lower() if desc.dll else ""
+            for imp in getattr(desc, "imports", None) or ():
+                name = imp.name.decode("ascii", "replace") if imp.name else ""
+                if (dll, name) not in EXPERIMENTS:
                     continue
                 slot = imp.address - base
                 sites = []
@@ -111,19 +115,85 @@ def inspect(path):
                     containers=shader_containers(data, pe, memory))
 
 
-def main():
+def _validate_inputs(root: Path, parser: argparse.ArgumentParser) -> None:
+    missing = []
+    for name in NAMES:
+        image = root / name
+        if image.is_symlink():
+            raise ValueError(f"Expected image must not be a symlink: {image}")
+        if not image.exists():
+            missing.append(name)
+            continue
+        if image.is_dir():
+            raise IsADirectoryError(f"Expected image path is a directory: {image}")
+        if not image.is_file():
+            raise ValueError(f"Expected image must be a regular file: {image}")
+        if not os.access(image, os.R_OK):
+            raise PermissionError(f"Expected image is not readable: {image}")
+        with image.open("rb"):
+            pass
+    if missing:
+        parser.error(f"Missing expected image(s) in {root}: {', '.join(missing)}")
+
+
+def _validate_output(output: Path) -> None:
+    if output.is_symlink():
+        raise ValueError(f"Output path must not be a symlink: {output}")
+    if output.is_dir():
+        raise IsADirectoryError(f"Output path is a directory: {output}")
+    if output.exists() and not output.is_file():
+        raise ValueError(f"Output path is not a regular file: {output}")
+    for parent in output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"Output parent is not a directory: {parent}")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write UTF-8 text to a sibling temp file and atomically replace path, leaving 0 temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        tmp_path.replace(path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
-    args = parser.parse_args()
-    root = args.directory.resolve(strict=True)
+    args = parser.parse_args(argv)
+    try:
+        root = args.directory.resolve(strict=True)
+    except OSError as exc:
+        parser.error(str(exc))
+    if not root.is_dir():
+        parser.error(f"Input path is not a directory: {root}")
     output = Path(__file__).resolve().parents[1] / "out/calls/six-apis.json"
-    if output.resolve().is_relative_to(root):
-        parser.error("Choose a build directory separate from the report directory")
-    rows = {name: inspect(root / name) for name in NAMES}
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    try:
+        if output.is_relative_to(root) or output.resolve().is_relative_to(root):
+            parser.error("Choose a build directory separate from the report directory")
+        _validate_output(output)
+        _validate_inputs(root, parser)
+        rows = {name: inspect(root / name) for name in NAMES}
+        _write_atomic(output, json.dumps(rows, indent=2) + "\n")
+    except (OSError, ValueError, struct.error, pefile.PEFormatError, subprocess.SubprocessError) as exc:
+        parser.exit(1, f"call_evidence: {exc}\n")
     print(output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
