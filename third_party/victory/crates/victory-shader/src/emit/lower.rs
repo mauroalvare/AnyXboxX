@@ -3866,9 +3866,14 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let (k16, k8) = (k(self, 16), k(self, 0xFF));
+        let (k16, max_hi) = (k(self, 16), k(self, MEMORY_PAGES >> 16));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
-        let high = self.s.m.bin(c, Bin::And, hi, k8);
+        // Clamp `hi` before shifting so addresses at or above 2^40 (1 TiB,
+        // e.g. `hi = 0x100`) never wrap back into mapped pages below 128 GiB.
+        let high = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[hi, max_hi]);
+        self.s.m.tag(high, Tag::Clamp);
         let high = self.s.m.bin(c, Bin::Shl, high, k16);
         let page = self.s.m.bin(c, Bin::Or, low, high);
         // Inside the directory whatever the address (lanes that do not run
@@ -3903,6 +3908,7 @@ impl<'a> Lower<'a> {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
         let places = k(self, MEMORY_FAULTS - 1);
+        // Out-of-range addresses log the clamped sentinel page.
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;

@@ -60,6 +60,13 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// How box-child sorting is controlled for a BVH node test.
+#[derive(Clone, Copy)]
+enum BoxSort {
+    Static(bool),
+    Dynamic(V),
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -77,8 +84,8 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
-        if *a16 || *d16 || *tfe || *lwe || *dmask != 0xf {
-            return Err("a ray-tracing node test with 16-bit operands or a partial result");
+        if *a16 || *d16 || *tfe || *lwe || *dmask == 0 || *dmask > 0xf {
+            return Err("a ray-tracing node test with 16-bit operands or an empty result");
         }
         let wide = inst.name() == "image_bvh64_intersect_ray";
         // Operand VGPRs in order: the node pointer (two dwords in the
@@ -105,12 +112,11 @@ impl<'a> Lower<'a> {
             .find(|n| n.0 == site)
             .map(|n| n.1)
             .ok_or("an untracked ray-tracing structure")?;
-        let (sort, barycentrics) = match nodes {
-            BvhNodes::Resource => (true, true),
-            BvhNodes::Memory { word1, word3 } => (
-                word1 & bvh::BOX_SORT != 0,
-                word3 & bvh::RETURN_BARYCENTRICS != 0,
-            ),
+        let (static_sort, barycentrics) = match nodes {
+            BvhNodes::Resource => (Some(true), true),
+            BvhNodes::Memory { box_sort, word3 } => {
+                (box_sort, word3 & bvh::RETURN_BARYCENTRICS != 0)
+            }
         };
         if !barycentrics {
             // Mode 0 returns a triangle id and a hit status in the last two
@@ -161,6 +167,17 @@ impl<'a> Lower<'a> {
                 Some(self.handle(site, src, false, (11, 0))?)
             }
             BvhNodes::Memory { .. } => None,
+        };
+        let sort = match (static_sort, mem_words) {
+            (Some(s), _) => BoxSort::Static(s),
+            (None, Some(words)) => {
+                let c = self.cur;
+                let bit = self.s.m.i32(bvh::BOX_SORT);
+                let masked = self.s.m.bin(c, Bin::And, words[1], bit);
+                let z = self.s.m.i32(0);
+                BoxSort::Dynamic(self.s.m.cmp(c, pred::NE, masked, z))
+            }
+            (None, None) => unreachable!(),
         };
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
@@ -235,8 +252,13 @@ impl<'a> Lower<'a> {
             results.push((phi, zero));
         }
         let results = self.end_guarded(gate, &results);
+        // Partial masks assume ordinary MIMG packing into consecutive VGPRs.
+        let mut out_reg = 0u8;
         for (k, &r) in results.iter().enumerate() {
-            self.write(inst, Reg::V(dst + k as u8), r, guard);
+            if (*dmask >> k) & 1 != 0 {
+                self.write(inst, Reg::V(dst + out_reg), r, guard);
+                out_reg += 1;
+            }
         }
         Ok(())
     }
@@ -369,7 +391,7 @@ impl<'a> Lower<'a> {
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
     /// current block and leaves `self.cur` at the block it ends in.
-    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
+    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: BoxSort) -> [V; 4] {
         let head = self.cur;
         // Load the entire first 64 bytes (4 children + 12 box dwords) before
         // branching on 32-bit vs 16-bit bounds so mixed warps never read bytes
@@ -578,9 +600,14 @@ impl<'a> Lower<'a> {
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
-        if sort {
+        if !matches!(sort, BoxSort::Static(false)) {
             for (a, b) in [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)] {
-                let swap = self.s.m.cmp(c, pred::OLT, distances[b], distances[a]);
+                let closer = self.s.m.cmp(c, pred::OLT, distances[b], distances[a]);
+                let swap = match sort {
+                    BoxSort::Static(true) => closer,
+                    BoxSort::Dynamic(enabled) => self.s.m.bin(c, Bin::And, closer, enabled),
+                    BoxSort::Static(false) => unreachable!(),
+                };
                 let (da, db) = (distances[a], distances[b]);
                 distances[a] = self.s.m.select(c, swap, db, da);
                 distances[b] = self.s.m.select(c, swap, da, db);

@@ -172,8 +172,10 @@ pub enum BvhNodes {
     Resource,
     /// Title memory by address: the code makes the descriptor from numbers
     /// (the title: the whole address space, or one structure's address in
-    /// dword 0). Dwords 1 and 3, which hold its flags.
-    Memory { word1: u32, word3: u32 },
+    /// dwords 0-1). `box_sort` is bit 31 of dword 1 when statically known, or
+    /// `None` when dword 1 is computed dynamically and bit 31 must be tested
+    /// at runtime. `word3` holds the constant flags and descriptor type.
+    Memory { box_sort: Option<bool>, word3: u32 },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -272,10 +274,16 @@ pub fn track(
                         _ => None,
                     };
                     match (word(1), word(3)) {
-                        (Some(Term::Const(word1)), Some(Term::Const(word3)))
+                        (Some(w1), Some(Term::Const(word3)))
                             if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
                         {
-                            out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                            out.bvh.push((
+                                site,
+                                BvhNodes::Memory {
+                                    box_sort: t.box_sort_flag(w1),
+                                    word3,
+                                },
+                            ));
                         }
                         _ => {
                             descriptor(rsrc, Role::Resource)?;
@@ -565,6 +573,36 @@ impl<'a> Tracer<'a> {
 
     fn origin(&self, v: Value) -> Term {
         self.origin[v.0 as usize]
+    }
+
+    /// Whether `BOX_SORT` (bit 31 of BVH descriptor dword 1) is statically
+    /// known for `term`, or `None` when it must be tested dynamically at
+    /// runtime.
+    fn box_sort_flag(&self, term: Term) -> Option<bool> {
+        let bit = crate::bvh::BOX_SORT;
+        match term {
+            Term::Const(w) => Some(w & bit != 0),
+            Term::Value(v) => {
+                if let Some((_, [a, b])) = self.sop2(v, &["s_or_b32"])
+                    && (matches!(a, Term::Const(c) if c & bit != 0)
+                        || matches!(b, Term::Const(c) if c & bit != 0))
+                {
+                    return Some(true);
+                }
+                if let Some((_, [a, b])) = self.sop2(v, &["s_and_b32"])
+                    && (matches!(a, Term::Const(c) if c & bit == 0)
+                        || matches!(b, Term::Const(c) if c & bit == 0))
+                {
+                    return Some(false);
+                }
+                if let Some((_, [_, Term::Const(shift)])) = self.sop2(v, &["s_lshr_b32"])
+                    && (shift & 31) > 0
+                {
+                    return Some(false);
+                }
+                None
+            }
+        }
     }
 
     /// The origin of a one-dword operand as `inst` reads it.
