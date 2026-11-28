@@ -352,7 +352,9 @@ cbuffer Set : register(b0) {
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
-// Three a point: red, green and blue, each a mean and a direction.
+// Four float4s a point (64-byte cache-line aligned): red, green and blue
+// (each a direction and mean), then `(depth_z, 0, 0, 0)` so `raise` reuses
+// the coarse depth without 4 extra full-res `depth.Load` calls per pixel.
 RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
 // what the title's resolve left, what was found and what was written.
@@ -416,35 +418,50 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+groupshared float4 tile_pos[64];
+groupshared float3 tile_lit[64];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
+[numthreads(8, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    bool valid = at.x < PX && at.y < PY;
     float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float3 p = valid ? seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size) : float3(0, 0, 1);
     float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    // Cooperative 64-cell tiling cuts global UAV loads 64x while preserving
+    // the exact 0..CELLS accumulation order.
+    for (uint base = 0; base < CELLS; base += 64) {
+        tile_pos[gi] = cells[CELLS + 1 + base + gi];
+        tile_lit[gi] = cells[base + gi].rgb;
+        GroupMemoryBarrierWithGroupSync();
+        if (valid) {
+            for (uint k = 0; k < 64; k++) {
+                float4 c = tile_pos[k];
+                float3 L = tile_lit[k];
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 dir = d / sqrt(dd + 0.25 * r2);
+                whole += w;
+                toward += w * dir;
+                light += w * L;
+                red += w * L.r * dir;
+                green += w * L.g * dir;
+                blue += w * L.b * dir;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!valid) return;
     whole = max(whole, 1e-6);
     light /= whole;
     toward /= whole;
-    uint at0 = (at.y * PX + at.x) * 3;
+    uint at0 = (at.y * PX + at.x) * 4;
     points[at0] = float4(red / whole - light.r * toward, light.r);
     points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
     points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    points[at0 + 3] = float4(p.z, 0.0, 0.0, 0.0);
 }
 #endif
 
@@ -460,7 +477,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
+    uint at0 = (q.y * PX + q.x) * 4;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
@@ -569,10 +586,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float sum = 0;
     for (int k = 0; k < 4; k++) {
         int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        uint at0 = (q.y * PX + q.x) * 4;
+        float z = points[at0 + 3].x;
         float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
         float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
         sr += w * points[at0];
         sg += w * points[at0 + 1];
         sb += w * points[at0 + 2];
@@ -611,7 +628,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+const POINT_BYTES: u64 = 160 * 90 * 64;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
@@ -724,10 +741,19 @@ pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
     pass().map(|p| (p.stats.clone(), p.cells.clone()))
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
-    // SAFETY: an open list; the barrier names no resource.
-    unsafe { list.ResourceBarrier(&[barrier]) };
+fn uav_barrier_of(res: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed COM pointer valid for the ResourceBarrier call.
+                pResource: std::mem::ManuallyDrop::new(
+                    res.map(|r| unsafe { std::mem::transmute_copy(r) }),
+                ),
+            }),
+        },
+    }
 }
 
 /// How a resolve of the reflections was dispatched.
@@ -828,6 +854,9 @@ pub(crate) struct Views {
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
     pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
+    /// The host texture behind `image`, for resource-scoped UAV barriers
+    /// (falls back to a global UAV barrier if `None`).
+    pub(crate) target: Option<ID3D12Resource>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -854,7 +883,6 @@ impl IndirectHold<'_> {
             list.Dispatch(groups[0], groups[1], 1);
             list.ResourceBarrier(&[transition(self.buffer, readable, arguments)]);
         }
-        uav_barrier(list);
     }
 }
 
@@ -905,6 +933,9 @@ pub(crate) fn after(
     list.keep(&pass.cells);
     list.keep(&pass.points);
     list.keep(&pass.stats);
+    if let Some(target) = &views.target {
+        list.keep(target);
+    }
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
     let mut words = [0u32; 16];
@@ -927,6 +958,7 @@ pub(crate) fn after(
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
     let l = &list.list;
+    let target = views.target.as_ref();
     let indirect = indirect.and_then(|args| pass.hold_indirect.as_ref().map(|(root, pso)| (args, root, pso)));
     let root = if views.depth.is_some() {
         &pass.resolve_root
@@ -937,7 +969,6 @@ pub(crate) fn after(
     // program has just used the bound views, so the textures are in the
     // states these views need; buffers the list keeps.
     unsafe {
-        uav_barrier(l);
         l.SetComputeRootSignature(root);
         l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.image);
@@ -947,32 +978,61 @@ pub(crate) fn after(
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(5, depth);
         }
-        let run = |pso: &ID3D12PipelineState, x, y, z| {
-            l.SetPipelineState(pso);
-            l.Dispatch(x, y, z);
-            uav_barrier(l);
-        };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                // Wait only on the title's radiance UAV before sampling it;
+                // flush our private `cells` UAV after `mean` so `Role::Air` and
+                // `Role::Resolve` (`place`/`gather`/`raise`) observe `cells[CELLS]`
+                // without a global UAV barrier.
+                l.ResourceBarrier(&[uav_barrier_of(target)]);
+                l.SetPipelineState(&pass.keep);
+                l.Dispatch(8, 9, 1);
+                l.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
+                l.SetPipelineState(&pass.mean);
+                l.Dispatch(1, 1, 1);
+                l.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Air => {
+                l.ResourceBarrier(&[uav_barrier_of(target)]);
+                l.SetPipelineState(&pass.air);
+                l.Dispatch(views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2));
+                l.ResourceBarrier(&[uav_barrier_of(target)]);
+            }
             Role::Reflect => {
+                l.ResourceBarrier(&[uav_barrier_of(target)]);
                 let groups = views.size.map(|size| size.div_ceil(8));
                 if let Some((args, _, pso)) = indirect {
                     args.run(l, pso, groups);
                 } else if let Some(hold) = &pass.hold {
-                    run(hold, groups[0], groups[1], 1);
+                    l.SetPipelineState(hold);
+                    l.Dispatch(groups[0], groups[1], 1);
                 }
+                l.ResourceBarrier(&[uav_barrier_of(target)]);
             }
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    // `place` and `gather` read only `depth` (SRV) and our private
+                    // `cells` buffer. `depth` cannot have an unsynchronized UAV
+                    // write here: before the title's Resolve dispatch ran, `draw.rs`
+                    // already flushed any depth color-twin UAV writes via
+                    // `list.twin_use(..., false, false)` and transitioned `depth`
+                    // into `SHADER_RESOURCE` (`ensure_state`), and `pass.cells` was
+                    // synchronized after `mean` in `Role::Radiance`. They are
+                    // therefore independent of the title's `light` UAV write and
+                    // can run before waiting on `target` prior to `raise`.
+                    l.SetPipelineState(&pass.place);
+                    l.Dispatch(8, 9, 1);
+                    l.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
+                    l.SetPipelineState(&pass.gather);
+                    l.Dispatch(20, 12, 1);
+                    l.ResourceBarrier(&[uav_barrier_of(Some(&pass.points)), uav_barrier_of(target)]);
+                } else {
+                    l.ResourceBarrier(&[uav_barrier_of(target)]);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                l.SetPipelineState(&pass.raise);
+                l.Dispatch(views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                l.ResourceBarrier(&[uav_barrier_of(target)]);
             }
         }
     }
@@ -1215,5 +1275,615 @@ mod tests {
             Some(COUNTS_FIRST + COUNTS_EVERY)
         );
         assert_eq!(counts_due(later + 1, &mut at), None);
+    }
+
+    /// Original untiled `gather` + redundant-`seen()` `raise` kept in tests as
+    /// the bit-exact oracle and performance baseline.
+    const LEGACY_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), DescriptorTable(SRV(t0))"
+#define CX 64
+#define CY 36
+#define CELLS (CX * CY)
+#define PX 160
+#define PY 90
+cbuffer Set : register(b0) {
+    float level; float constant; float strength; float radius;
+    float near; float tan_y; uint width; uint height;
+    float follow; float most; float air; uint probe;
+    float jump; float fresh; float dt; float least;
+};
+Texture2D<float> depth : register(t0);
+RWStructuredBuffer<float4> cells : register(u1);
+RWStructuredBuffer<float4> points : register(u2);
+RWByteAddressBuffer stats : register(u3);
+static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+
+float3 seen(int2 p, float2 size) {
+    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+    float z = min(near / max(d, 1e-7), 1000.0);
+    float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
+    return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
+}
+
+#ifdef GATHER
+[RootSignature(RS)]
+[numthreads(8, 2, 1)]
+void gather(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float whole = 0;
+    float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        float4 c = cells[CELLS + 1 + i];
+        float3 L = cells[i].rgb;
+        float3 d = c.xyz - p;
+        float dd = dot(d, d);
+        float w = c.w / (dd + r2);
+        float3 dir = d / sqrt(dd + 0.25 * r2);
+        whole += w;
+        toward += w * dir;
+        light += w * L;
+        red += w * L.r * dir;
+        green += w * L.g * dir;
+        blue += w * L.b * dir;
+    }
+    whole = max(whole, 1e-6);
+    light /= whole;
+    toward /= whole;
+    uint at0 = (at.y * PX + at.x) * 3;
+    points[at0] = float4(red / whole - light.r * toward, light.r);
+    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
+    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+}
+#endif
+
+#ifdef RAISE
+RWTexture2D<uint> light : register(u0);
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void raise(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    if (at.x >= width || at.y >= height) return;
+    int2 p = int2(at.xy);
+    float3 c = seen(p, size);
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    float open = 1.0;
+    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+    float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
+    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+        float sum = 0.0;
+        const int N = 12;
+        for (int i = 0; i < N; i++) {
+            float a = i * 2.399963 + noise * 6.2831853;
+            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+            float3 v = seen(p + int2(round(o)), size) - c;
+            float vv = dot(v, v);
+            float over = dot(v, n) - 0.004 * c.z - 0.005;
+            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+        }
+        open = saturate(1.0 - strength * 2.0 * sum / N);
+    }
+    float3 found;
+    if (constant > 0.0) {
+        found = float3(1.0, 0.98, 0.94) * constant * open;
+        light[p] = pack(found);
+        return;
+    }
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += w * points[at0];
+        sg += w * points[at0 + 1];
+        sb += w * points[at0 + 2];
+        sum += w;
+    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float3 was = unpack(light[p]);
+    float left = dot(was, LUMA);
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
+    float has = dot(was, LUMA);
+    was *= min(1.0, top / max(has, 1e-6));
+    float3 written = max(was, found * least);
+    light[p] = pack(written);
+    if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
+        uint ignored;
+        stats.InterlockedAdd(0, 1, ignored);
+        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+    }
+}
+#endif
+"#;
+
+    fn run_resolve_compare(width: u32, height: u32, iters: usize, verify_pixels: bool) -> Option<(String, [f64; 4], [f64; 4])> {
+        use std::mem::ManuallyDrop;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN,
+            DXGI_SAMPLE_DESC,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+            IDXGIAdapter1, IDXGIFactory4,
+        };
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+
+        let (device, adapter_name) = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let mut found = None;
+            for i in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+                let Ok(desc) = adapter.GetDesc1() else { continue };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..len]);
+                let mut dev: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok()
+                    && let Some(d) = dev
+                {
+                    found = Some((d, name));
+                    break;
+                }
+            }
+            match found {
+                Some(pair) => pair,
+                None => {
+                    let warp: IDXGIAdapter1 = factory.EnumWarpAdapter().ok()?;
+                    let mut dev: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut dev).ok()?;
+                    (dev?, "WARP".to_owned())
+                }
+            }
+        };
+
+        let make_buf = |bytes: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> Option<ID3D12Resource> {
+            let mut res: Option<ID3D12Resource> = None;
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes.max(256),
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_UNKNOWN,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut res,
+                    )
+                    .ok()?;
+            }
+            res
+        };
+
+        let make_tex = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> Option<ID3D12Resource> {
+            let mut res: Option<ID3D12Resource> = None;
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: u64::from(width),
+                            Height: height,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut res,
+                    )
+                    .ok()?;
+            }
+            res
+        };
+
+        let pass = make(&device, |bytes| {
+            make_buf(
+                bytes,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )
+        }, false)
+        .ok()?;
+
+        let make_legacy_pso = |part: &str, entry| -> ID3D12PipelineState {
+            let code = crate::host::compile(&format!("#define {part}\n{LEGACY_SOURCE}"), entry, s!("cs_5_1")).unwrap();
+            unsafe {
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&pass.resolve_root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                    ..Default::default()
+                };
+                device.CreateComputePipelineState(&desc).unwrap()
+            }
+        };
+        let legacy_gather = make_legacy_pso("GATHER", s!("gather"));
+        let legacy_raise = make_legacy_pso("RAISE", s!("raise"));
+
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .ok()?;
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            list.Close().ok()?;
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let event = CreateEventW(None, false, false, None).ok()?;
+            let ts_freq = queue.GetTimestampFrequency().unwrap_or(1);
+
+            let depth_tex = make_tex(DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+            let light_tex = make_tex(DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)?;
+
+            let row_pitch = (width * 4).next_multiple_of(256);
+            let tex_bytes = u64::from(row_pitch) * u64::from(height);
+            let depth_up = make_buf(tex_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let light_up = make_buf(tex_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let cells_up = make_buf(CELL_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let readback = make_buf(tex_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+
+            // Populate synthetic depth with an occluder wall/pillar step + varied background,
+            // synthetic title resolve light (with dark shadows + bright sky + magenta garbage),
+            // and synthetic cell radiance.
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            depth_up.Map(0, None, Some(&mut ptr)).ok()?;
+            for y in 0..height {
+                let row = ptr.cast::<u8>().add((y * row_pitch) as usize).cast::<f32>();
+                for x in 0..width {
+                    let in_occluder = x >= width / 4 && x < width / 2 && y >= height / 4 && y < (3 * height) / 4;
+                    let z = if in_occluder { 3.5f32 } else { 12.0 + (x as f32 / width as f32) * 8.0 };
+                    *row.add(x as usize) = 0.1 / z;
+                }
+            }
+            depth_up.Unmap(0, None);
+
+            light_up.Map(0, None, Some(&mut ptr)).ok()?;
+            for y in 0..height {
+                let row = ptr.cast::<u8>().add((y * row_pitch) as usize).cast::<u32>();
+                for x in 0..width {
+                    // Mix of dark interior (0), bright outdoor sky, and probe garbage.
+                    let packed = if (x + y) % 17 == 0 {
+                        0x7800_01ffu32
+                    } else if x < width / 2 {
+                        0u32
+                    } else {
+                        0x7008_0200u32
+                    };
+                    *row.add(x as usize) = packed;
+                }
+            }
+            light_up.Unmap(0, None);
+
+            cells_up.Map(0, None, Some(&mut ptr)).ok()?;
+            let c_slice = std::slice::from_raw_parts_mut(ptr.cast::<[f32; 4]>(), (2 * CELLS + 1) as usize);
+            for i in 0..CELLS as usize {
+                let fx = (i % 64) as f32 / 64.0;
+                let fy = (i / 64) as f32 / 36.0;
+                c_slice[i] = [0.4 + 0.6 * fx, 0.35 + 0.5 * fy, 0.3 + 0.4 * (1.0 - fx), 1.0];
+            }
+            c_slice[CELLS as usize] = [0.55, 0.50, 0.45, 2.0];
+            cells_up.Unmap(0, None);
+
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            let inc = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let cpu0 = heap.GetCPUDescriptorHandleForHeapStart();
+            let cpu1 = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu0.ptr + inc as usize };
+            let gpu0 = heap.GetGPUDescriptorHandleForHeapStart();
+            let gpu1 = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu0.ptr + u64::from(inc) };
+
+            device.CreateShaderResourceView(
+                &depth_tex,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_FLOAT,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                    },
+                }),
+                cpu0,
+            );
+            device.CreateUnorderedAccessView(
+                &light_tex,
+                None,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+                    },
+                }),
+                cpu1,
+            );
+
+            let mut ts_heap: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 8, NodeMask: 0 },
+                    &mut ts_heap,
+                )
+                .ok()?;
+            let ts_heap = ts_heap?;
+            let ts_rb = make_buf(64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+
+            let mut fence_val = 0u64;
+            let mut wait = || {
+                fence_val += 1;
+                queue.Signal(&fence, fence_val).unwrap();
+                fence.SetEventOnCompletion(fence_val, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+            };
+
+            let footprint = |res: &ID3D12Resource, format: DXGI_FORMAT| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(res.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: width, Height: height, Depth: 1, RowPitch: row_pitch },
+                    },
+                },
+            };
+            let sub0 = |res: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(res.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+
+            // Upload depth + cells once.
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            list.CopyTextureRegion(&sub0(&depth_tex), 0, 0, 0, &footprint(&depth_up, DXGI_FORMAT_R32_FLOAT), None);
+            list.CopyTextureRegion(&sub0(&light_tex), 0, 0, 0, &footprint(&light_up, DXGI_FORMAT_R32_UINT), None);
+            list.CopyBufferRegion(&pass.cells, 0, &cells_up, 0, CELL_BYTES);
+            list.ResourceBarrier(&[
+                crate::host::transition(&depth_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                crate::host::transition(&light_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                crate::host::transition(&pass.cells, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+            ]);
+            list.Close().unwrap();
+            let cmd: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            wait();
+
+            let mut words = [0u32; 16];
+            for (to, v) in words.iter_mut().zip([0.8f32, 0.0, 1.0, 0.6, 0.1, 0.45]) {
+                *to = v.to_bits();
+            }
+            words[6] = width;
+            words[7] = height;
+            words[8] = 0.04f32.to_bits();
+            words[9] = 4.0f32.to_bits();
+            words[15] = 1.0f32.to_bits();
+            words[14] = 0.033f32.to_bits();
+
+            let mut run_once = |optimized: bool, reset_and_read: bool| -> ([f64; 4], Vec<u32>) {
+                allocator.Reset().unwrap();
+                list.Reset(&allocator, None).unwrap();
+                if reset_and_read {
+                    list.ResourceBarrier(&[crate::host::transition(
+                        &light_tex,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    list.CopyTextureRegion(&sub0(&light_tex), 0, 0, 0, &footprint(&light_up, DXGI_FORMAT_R32_UINT), None);
+                    list.ResourceBarrier(&[crate::host::transition(
+                        &light_tex,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                }
+                let heaps = [Some(heap.clone())];
+                list.SetDescriptorHeaps(&heaps);
+                list.SetComputeRootSignature(&pass.resolve_root);
+                list.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+                list.SetComputeRootDescriptorTable(1, gpu1);
+                list.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(3, pass.points.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(4, pass.stats.GetGPUVirtualAddress());
+                list.SetComputeRootDescriptorTable(5, gpu0);
+
+                list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                if optimized {
+                    list.SetPipelineState(&pass.place);
+                    list.Dispatch(8, 9, 1);
+                    list.ResourceBarrier(&[uav_barrier_of(Some(&pass.cells))]);
+                    list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    list.SetPipelineState(&pass.gather);
+                    list.Dispatch(20, 12, 1);
+                    list.ResourceBarrier(&[uav_barrier_of(Some(&pass.points)), uav_barrier_of(Some(&light_tex))]);
+                    list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                    list.SetPipelineState(&pass.raise);
+                    list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+                    list.ResourceBarrier(&[uav_barrier_of(Some(&light_tex))]);
+                    list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                } else {
+                    list.ResourceBarrier(&[uav_barrier_of(None)]);
+                    list.SetPipelineState(&pass.place);
+                    list.Dispatch(8, 9, 1);
+                    list.ResourceBarrier(&[uav_barrier_of(None)]);
+                    list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    list.SetPipelineState(&legacy_gather);
+                    list.Dispatch(20, 45, 1);
+                    list.ResourceBarrier(&[uav_barrier_of(None)]);
+                    list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                    list.SetPipelineState(&legacy_raise);
+                    list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+                    list.ResourceBarrier(&[uav_barrier_of(None)]);
+                    list.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                }
+                list.ResolveQueryData(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, &ts_rb, 0);
+                if reset_and_read {
+                    list.ResourceBarrier(&[crate::host::transition(
+                        &light_tex,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    list.CopyTextureRegion(&footprint(&readback, DXGI_FORMAT_R32_UINT), 0, 0, 0, &sub0(&light_tex), None);
+                    list.ResourceBarrier(&[crate::host::transition(
+                        &light_tex,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                }
+                list.Close().unwrap();
+                let cmd: ID3D12CommandList = list.cast().unwrap();
+                queue.ExecuteCommandLists(&[Some(cmd)]);
+                wait();
+
+                let mut ts = [0u64; 4];
+                ts_rb.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(ptr.cast::<u64>(), ts.as_mut_ptr(), 4);
+                ts_rb.Unmap(0, None);
+                let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * 1000.0 / ts_freq as f64;
+                let times = [ms(ts[0], ts[1]), ms(ts[1], ts[2]), ms(ts[2], ts[3]), ms(ts[0], ts[3])];
+
+                let mut out = Vec::new();
+                if reset_and_read {
+                    out.resize((width * height) as usize, 0);
+                    readback.Map(0, None, Some(&mut ptr)).unwrap();
+                    for y in 0..height as usize {
+                        let row = ptr.cast::<u8>().add(y * row_pitch as usize).cast::<u32>();
+                        std::ptr::copy_nonoverlapping(row, out.as_mut_ptr().add(y * width as usize), width as usize);
+                    }
+                    readback.Unmap(0, None);
+                }
+                (times, out)
+            };
+
+            if verify_pixels {
+                let (_, legacy_px) = run_once(false, true);
+                let (_, opt_px) = run_once(true, true);
+                let diffs = legacy_px.iter().zip(&opt_px).filter(|(a, b)| a != b).count();
+                assert_eq!(diffs, 0, "optimized ambient resolve differed on {diffs} of {} pixels", legacy_px.len());
+            }
+
+            let median = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            };
+            let mut measure = |optimized: bool| -> [f64; 4] {
+                for _ in 0..8.min(iters) {
+                    run_once(optimized, false);
+                }
+                let mut cols = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                for _ in 0..iters {
+                    let (t, _) = run_once(optimized, false);
+                    for k in 0..4 {
+                        cols[k].push(t[k]);
+                    }
+                }
+                std::array::from_fn(|k| median(cols[k].clone()))
+            };
+
+            let before = measure(false);
+            let after = measure(true);
+            Some((adapter_name, before, after))
+        }
+    }
+
+    /// Proves that `groupshared`-tiled `gather`, cached coarse depth in `raise`,
+    /// and scoped UAV barriers produce bit-for-bit identical `R9G9B9E5` output
+    /// to the original implementation on the host GPU.
+    #[test]
+    fn optimized_resolve_matches_original_bit_for_bit() {
+        let _ = run_resolve_compare(320, 180, 1, true);
+    }
+
+    /// Measures `ambient::Role::Resolve` (`place` + `gather` + `raise`) at
+    /// 1920x1080 and 3840x2160 against the 33.3 ms (30 FPS) frame budget.
+    /// Run with:
+    /// `cargo test -p victory-gpu --release --lib ambient::tests::ambient_resolve_perf_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ambient_resolve_perf_bench() {
+        const BUDGET_MS: f64 = 33.333;
+        for (w, h) in [(1920, 1080), (3840, 2160)] {
+            let (adapter, before, after) = run_resolve_compare(w, h, 40, true).expect("D3D12 device");
+            let delta = after[3] - before[3];
+            let pct = (1.0 - after[3] / before[3]) * 100.0;
+            println!("adapter={adapter} res={w}x{h} budget_30fps={BUDGET_MS:.3}ms bit_exact=true");
+            println!(
+                "BEFORE total={:.4}ms ({:.2}% of 33.3ms) | place={:.4}ms gather={:.4}ms raise={:.4}ms",
+                before[3],
+                before[3] / BUDGET_MS * 100.0,
+                before[0],
+                before[1],
+                before[2]
+            );
+            println!(
+                "AFTER  total={:.4}ms ({:.2}% of 33.3ms) | place={:.4}ms gather={:.4}ms raise={:.4}ms",
+                after[3],
+                after[3] / BUDGET_MS * 100.0,
+                after[0],
+                after[1],
+                after[2]
+            );
+            println!("DELTA  total={delta:+.4}ms ({pct:+.1}%)");
+        }
     }
 }
