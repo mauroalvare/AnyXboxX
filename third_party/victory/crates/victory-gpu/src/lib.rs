@@ -85,6 +85,8 @@ mod port_journal;
 mod land;
 #[cfg(all(test, windows))]
 mod loadprobe;
+#[cfg(all(test, windows))]
+mod rt_passes_tests;
 pub mod list;
 pub mod object;
 pub mod pipeline;

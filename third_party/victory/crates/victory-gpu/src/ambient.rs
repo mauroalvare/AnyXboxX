@@ -1,6 +1,6 @@
 //! A stand-in for the indirect light the title traces rays for.
 //!
-//! With the ray-tracing structure builder off (`crate::pipeline::builder_runs`)
+//! With the ray-tracing structure builder off (`crate::pipeline::builder_ready`)
 //! the title's rays find nothing. Its program that resolves the diffuse light
 //! of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the
 //! sky's light outdoors, nothing indoors (walls are black where no lamp or
@@ -163,7 +163,7 @@ fn parse_band(set: &str) -> Option<Band> {
 /// Whether the stand-in is on: set, and the title's rays find nothing (or
 /// the band is asked for with them).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_ready())
 }
 
 /// The title's leftover light is kept between these multiples of the
@@ -171,7 +171,7 @@ pub(crate) fn on() -> bool {
 /// most four times it.
 fn bounds() -> (f32, f32) {
     match rt_band() {
-        Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
+        Some(b) if crate::pipeline::builder_ready() => (b.least, b.most),
         _ => (1.0, 4.0),
     }
 }
@@ -761,7 +761,7 @@ pub(crate) fn holds() -> bool {
         Set::Constant(_) => true,
     };
     pass().is_some_and(|p| p.hold.is_some() || p.hold_indirect.is_some())
-        && !crate::pipeline::builder_runs()
+        && !crate::pipeline::builder_ready()
         && (constant || KEPT.load(Relaxed))
 }
 
@@ -885,7 +885,7 @@ pub(crate) fn after(
     if role == Role::Reflect {
         // The traced reflections are the title's own while its rays run.
         let can_hold = if indirect.is_some() { pass.hold_indirect.is_some() } else { pass.hold.is_some() };
-        if !can_hold || crate::pipeline::builder_runs() {
+        if !can_hold || crate::pipeline::builder_ready() {
             return false;
         }
         // Its own line: the four below are taken by the others first.
