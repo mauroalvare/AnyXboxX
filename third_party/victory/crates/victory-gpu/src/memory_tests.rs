@@ -653,10 +653,10 @@ fn synthetic_bvh_static_dynamic_move_remove_and_lifetime_on_gpu() {
     {
         let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let m = guard.as_mut().unwrap();
-        let free_before = m.free.len();
+        let free_before = m.free_pages;
         m.reclaim_retired();
         assert!(m.retiring.is_empty(), "completed flights must drain retiring queue");
-        assert!(m.free.len() >= free_before + retired_while_in_flight, "retired pages must return to free list");
+        assert!(m.free_pages >= free_before + retired_while_in_flight, "retired pages must return to free list");
     }
 
     // Clean up packed entries so we leave global MEMORY clean.
@@ -934,7 +934,7 @@ fn bench_bvh_static_and_dynamic_sustained() {
     let (arenas_count, pages_held, free_pages) = {
         let g = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let m = g.as_ref().unwrap();
-        (m.arenas.len(), m.pages.len(), m.free.len())
+        (m.arenas.len(), m.pages.len(), m.free_pages)
     };
 
     let (sp_med, sp_p95, sp_mean) = stats_summary(static_prep_us);
