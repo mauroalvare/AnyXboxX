@@ -108,7 +108,8 @@ jobs:
         run: cargo test --locked --release --workspace
       - name: Run VIctory tests
         working-directory: source/third_party/victory
-        run: cargo test --locked --release --workspace --features diagnostics
+        # WARP fixtures share GPU state within the test process.
+        run: cargo test --locked --release --workspace --features diagnostics -- --test-threads=1
       - name: Package Windows x64
         id: package
         env:
