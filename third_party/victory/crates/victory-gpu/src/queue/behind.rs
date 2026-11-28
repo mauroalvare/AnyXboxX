@@ -125,8 +125,11 @@ struct State<W> {
     /// The number the next entry gets.
     next: u64,
     /// The queue whose entry is being done now (it is no longer in `items`;
-    /// what that queue is given stays behind it all the same).
+    /// what that queue is given stays behind it all the same), and its entry
+    /// number so retirement barriers can tell whether it has finished
+    /// reaching `host::submit`.
     running: Option<usize>,
+    running_number: Option<u64>,
     /// Times a look at the line was asked for, and the last of them that a
     /// whole look has followed.
     asked: u64,
@@ -169,6 +172,7 @@ impl<W: Work> Lane<W> {
                 items: VecDeque::new(),
                 next: 0,
                 running: None,
+                running_number: None,
                 asked: 0,
                 served: 0,
                 presents: 0,
@@ -247,6 +251,25 @@ impl<W: Work> Lane<W> {
         while state.served < ticket {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// Returns an exclusive entry-number watermark if any entry is currently
+    /// queued or executing in this lane, or `None` when completely idle.
+    pub(super) fn pending_mark(&self) -> Option<u64> {
+        let state = self.lock();
+        if state.items.is_empty() && state.running.is_none() {
+            None
+        } else {
+            Some(state.next)
+        }
+    }
+
+    /// Whether every entry with `number < limit` (including unfolded parts and
+    /// any currently running entry) has finished executing `Work::go`.
+    pub(super) fn passed_mark(&self, limit: u64) -> bool {
+        let state = self.lock();
+        state.running_number.is_none_or(|n| n >= limit)
+            && state.items.iter().all(|e| e.number >= limit)
     }
 
     /// Waits until at most `most` presents are in the line.
@@ -361,6 +384,7 @@ impl<W: Work> Lane<W> {
                 return false;
             };
             state.running = Some(entry.queue);
+            state.running_number = Some(entry.number);
             entry
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
@@ -378,6 +402,7 @@ impl<W: Work> Lane<W> {
             // is found first).
             let mut state = self.lock();
             state.running = None;
+            state.running_number = None;
             let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
             Self::unfold(&mut state, at, entry);
             drop(state);
@@ -433,6 +458,7 @@ impl<W: Work> Lane<W> {
         {
             let mut state = self.lock();
             state.running = None;
+            state.running_number = None;
             state.presents -= usize::from(shows);
             state.runs -= runs;
         }
@@ -860,6 +886,18 @@ fn started() -> bool {
 /// (`crate::host::retire` waits for them too).
 pub(super) fn queued() -> u64 {
     QUEUED.load(Relaxed)
+}
+
+/// Exclusive entry-number watermark if any async-submit entry is queued or
+/// running in `LANE`, or `None` when idle or when `VICTORY_ASYNC_SUBMIT` is off.
+pub(super) fn pending_mark() -> Option<u64> {
+    on().then(|| LANE.pending_mark()).flatten()
+}
+
+/// Whether every async-submit entry before `limit` has finished reaching
+/// `host::submit`.
+pub(super) fn passed_mark(limit: u64) -> bool {
+    !on() || LANE.passed_mark(limit)
 }
 
 /// Something a queue may stand at moved.
@@ -1365,5 +1403,35 @@ mod tests {
         assert_eq!(merge_stamp(0, 5), 0);
         assert_eq!(merge_stamp(5, 0), 0);
         assert_eq!(merge_stamp(0, 0), 0);
+    }
+
+    #[test]
+    fn pending_mark_tracks_queued_and_running_entries() {
+        let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));
+        assert_eq!(lane.pending_mark(), None);
+        std::thread::spawn(|| lane.serve());
+        let log: Log = Default::default();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        lane.push(1, [T::Slow("first", log.clone(), gate.clone())]);
+        let mark = lane.pending_mark().expect("queued entry must yield a watermark");
+        assert!(!lane.passed_mark(mark));
+        while lane.lock().running.is_none() {
+            std::thread::yield_now();
+        }
+        // Entry is mid-Work::go (popped from `items`, held in `running_number`).
+        assert!(!lane.passed_mark(mark), "running entry must still block passed_mark");
+        // A newer entry pushed after `mark` must not block `mark` once `first` finishes.
+        let gate2 = Arc::new((Mutex::new(false), Condvar::new()));
+        lane.push(1, [T::Slow("second", log.clone(), gate2.clone())]);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        while !lane.passed_mark(mark) {
+            std::thread::yield_now();
+        }
+        assert_eq!(*log.lock().unwrap(), ["first"]);
+        *gate2.0.lock().unwrap() = true;
+        gate2.1.notify_all();
+        lane.drain();
+        assert_eq!(lane.pending_mark(), None);
     }
 }

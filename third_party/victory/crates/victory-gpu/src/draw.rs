@@ -3561,7 +3561,7 @@ impl State {
         let host = crate::resource::host_resource(resource as This)?;
         // SAFETY: a live resource.
         let desc = unsafe { host.GetDesc() };
-        Some((host, desc, heap.gpu_handle(start.checked_add(offset.checked_mul(4)?)? / 32)))
+        Some((host.clone(), desc, heap.gpu_handle(start.checked_add(offset.checked_mul(4)?)? / 32)))
     }
 
     fn bound_table_view(&self, compute: bool, (slot, offset): (u8, u32)) -> Option<View> {
