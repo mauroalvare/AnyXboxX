@@ -625,6 +625,97 @@ fn merge_retired_batch(queue: &mut std::collections::VecDeque<(u64, Retired)>, b
     queue.extend(tail);
 }
 
+/// Submissions can enter before taking the host's submission lock. Track
+/// those still waiting for a GPU submission stamp in entry order.
+#[derive(Default)]
+struct BvhSubmissions {
+    next: u64,
+    waiting: Vec<u64>,
+}
+
+impl BvhSubmissions {
+    fn enter(&mut self) -> u64 {
+        let ticket = self.next;
+        self.next += 1;
+        self.waiting.push(ticket);
+        ticket
+    }
+
+    fn leave(&mut self, ticket: u64) {
+        if let Some(at) = self.waiting.iter().position(|&id| id == ticket) {
+            self.waiting.swap_remove(at);
+        }
+    }
+
+    fn all_started(&self, limit: u64) -> bool {
+        self.waiting.iter().all(|&ticket| ticket >= limit)
+    }
+}
+
+static BVH_SUBMISSIONS: Mutex<BvhSubmissions> = Mutex::new(BvhSubmissions { next: 0, waiting: Vec::new() });
+
+struct PendingBvhSubmission(u64);
+
+impl PendingBvhSubmission {
+    fn enter() -> Self {
+        Self(BVH_SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner()).enter())
+    }
+}
+
+impl Drop for PendingBvhSubmission {
+    fn drop(&mut self) {
+        BVH_SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner()).leave(self.0);
+    }
+}
+
+/// Wait for queued work, then for all submissions that have already entered
+/// to obtain a stamp. The resulting stamp is a fence for the retired page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BvhRetire {
+    Queued(u64),
+    Preparing(u64),
+    Submitted(u64),
+}
+
+pub(crate) fn bvh_retire_target() -> BvhRetire {
+    if let Some(limit) = crate::queue::pending_mark() {
+        BvhRetire::Queued(limit)
+    } else {
+        BvhRetire::Preparing(BVH_SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner()).next)
+    }
+}
+
+pub(crate) fn bvh_retire_ready(gate: &mut BvhRetire) -> bool {
+    if let BvhRetire::Queued(limit) = *gate {
+        if !crate::queue::passed_mark(limit) {
+            return false;
+        }
+        *gate = BvhRetire::Preparing(BVH_SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner()).next);
+    }
+    if let BvhRetire::Preparing(limit) = *gate {
+        let pending = BVH_SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.all_started(limit) {
+            return false;
+        }
+        *gate = BvhRetire::Submitted(STARTED.load(Ordering::Acquire));
+    }
+    matches!(*gate, BvhRetire::Submitted(stamp) if FINISHED.load(Ordering::Acquire) >= stamp)
+}
+
+#[test]
+fn bvh_retirement_waits_for_older_out_of_order_submissions() {
+    let mut pending = BvhSubmissions::default();
+    let first = pending.enter();
+    let second = pending.enter();
+    let limit = pending.next;
+    let newer = pending.enter();
+    pending.leave(second);
+    assert!(!pending.all_started(limit));
+    pending.leave(first);
+    assert!(pending.all_started(limit));
+    assert!(!pending.all_started(newer + 1));
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -7097,6 +7188,59 @@ impl Host {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn run_test_list_sync(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false, None, None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_test_list_async(&self, list: &HostList) -> (u64, u64) {
+        self.execute_own(list)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_test_fence(&self, fence: u64) {
+        // SAFETY: live fence and event owned by Host; wait until GPU reaches `fence`.
+        unsafe {
+            if self.fence.GetCompletedValue() < fence {
+                let _ = self.fence.SetEventOnCompletion(fence, self.event);
+                WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+        if late() {
+            settle_now(WHY_SYNC);
+        } else {
+            let started = STARTED.load(Ordering::Acquire);
+            FINISHED.store(started, Ordering::Release);
+            bury(started);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: live direct command queue.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adapter_label(&self) -> String {
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: live device; plain DXGI adapter query.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                return "unknown".into();
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()) else {
+                return "unknown".into();
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                return "unknown".into();
+            };
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            String::from_utf16_lossy(&desc.Description[..end])
+        }
+    }
+
     /// Sends `list`, a closed list of ours (the present's copy), as a
     /// flight ([`late_free_present`]): not waited for, settled with the
     /// others. The caller keeps the list and does not reset it before the
@@ -7371,6 +7515,7 @@ impl Host {
         heap_sync: Option<u64>,
         preplan: Option<card_steps::Preplan>,
     ) -> Submission<'a> {
+        let pending_bvh = PendingBvhSubmission::enter();
         // A list is whole only when it is closed.
         closed_for_execution(runs);
         #[cfg(feature = "diagnostics")]
@@ -7482,6 +7627,7 @@ impl Host {
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        drop(pending_bvh);
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -8273,6 +8419,24 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_refresh_count(&self) -> usize {
+        self.deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::Refresh(..)))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_host_count(&self) -> usize {
+        self.deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::Host(..)))
+            .count()
     }
 
     pub(crate) fn close(&self) {

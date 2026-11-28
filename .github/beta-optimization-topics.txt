@@ -1,0 +1,2 @@
+# Pinned fork optimization commits awaiting consolidation in this branch.
+# Each line holds a commit SHA followed by its fork branch name.

@@ -473,6 +473,20 @@ pub(crate) fn queued() -> u64 {
     behind::queued()
 }
 
+/// Exclusive entry-number watermark if any async-submit entry is currently
+/// queued or executing in [`behind`], or `None` when idle.
+#[cfg(windows)]
+pub(crate) fn pending_mark() -> Option<u64> {
+    behind::pending_mark()
+}
+
+/// Whether every async-submit entry before `limit` has finished reaching
+/// `host::submit`.
+#[cfg(windows)]
+pub(crate) fn passed_mark(limit: u64) -> bool {
+    behind::passed_mark(limit)
+}
+
 /// For the frame-rate line.
 #[cfg(windows)]
 pub(crate) fn behind_line(frames: f64) {

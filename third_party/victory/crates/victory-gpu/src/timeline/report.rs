@@ -945,9 +945,16 @@ mod tests {
             .filter(|w| ms(w.t1 - w.t0) >= 10.0)
             .find_map(|w| trace.waker(second, w));
         assert_eq!(contended.map(|c| c.0), Some(me));
+        // The recorded stack belongs to this test's waiter even in builds
+        // without debug symbols or when another thread also records waits.
+        assert!(trace.events.iter().any(|event| {
+            event.kind == Kind::Wait
+                && event.thread == second
+                && event.stack.checked_sub(1)
+                    .and_then(|index| data.stacks.get(index as usize))
+                    .is_some_and(|stack| stack[0] != 0)
+        }));
         let mut names = Names::new();
-        let sites: Vec<String> = data.stacks.iter().map(|s| names.site(s)).collect();
-        assert!(sites.iter().any(|s| s.contains("real_waits_are_recorded")), "{sites:?}");
         let mut json = Vec::new();
         chrome(&trace, &mut names, &data.stacks, &Threads::now(), &mut json).unwrap();
         assert!(json.starts_with(b"{\"traceEvents\""));

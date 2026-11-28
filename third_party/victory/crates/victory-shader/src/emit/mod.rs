@@ -90,6 +90,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lds_private;
 mod loose_lds;
 mod lower;
 mod own_bits;
@@ -164,6 +165,22 @@ pub fn helper_own() -> bool {
 pub fn early_depth_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LANE_PRIVATE_LDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether to enable experimental lane-private LDS lowering on wave32 hosts.
+/// The shader cache uses the same switch when choosing its translation key.
+pub fn lane_private_lds_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_LANE_PRIVATE_LDS.get() {
+        return enabled;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_LDS_PRIVATE").is_some_and(|value| value == "1"))
 }
 
 /// Which of a translated program's group barriers wait for the whole
