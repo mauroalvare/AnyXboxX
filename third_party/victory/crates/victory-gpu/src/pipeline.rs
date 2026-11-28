@@ -467,7 +467,7 @@ pub(crate) fn builder_runs() -> bool {
 /// count: neither reaches a buffer's host copy. After upstream #413,
 /// which leaves scalar-memory stores out and counts image stores.
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
+pub(crate) fn stores(program: &victory_shader::NativeProgram) -> bool {
     use victory_shader::gfx10::{Encoding, decode};
     let Ok(code) = decode(&program.code) else {
         return true;

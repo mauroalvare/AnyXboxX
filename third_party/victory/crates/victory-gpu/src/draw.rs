@@ -3333,8 +3333,6 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3407,7 +3405,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        self.buffers_written();
+        self.after_compute_dispatch(pipeline_stores(p));
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         use crate::ambient::{Dispatched, Role, note_reflect};
         let reflect = p.stages.first().and_then(|s| s.shader.ambient) == Some(Role::Reflect);
@@ -4568,6 +4566,12 @@ impl State {
     }
 }
 
+/// Whether any stage of `p` can store to buffer memory (or `VICTORY_WRITE_SKIP=0`
+/// asks for conservative buffer-write tracking).
+fn pipeline_stores(p: &HostPipeline) -> bool {
+    !write_skip() || p.stages.iter().any(|stage| stage.translated().stores)
+}
+
 impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
@@ -4575,6 +4579,17 @@ impl State {
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
+        }
+    }
+
+    /// Updates indirect-clamp batch and window state after a compute dispatch:
+    /// only shaders that can store to buffers can modify indirect arguments;
+    /// texture-only and read-only compute shaders (such as tiled RT resolve
+    /// passes) cannot alter argument buffers and preserve the open clamp batch.
+    fn after_compute_dispatch(&mut self, stores: bool) {
+        if stores {
+            self.window = None;
+            self.buffers_written();
         }
     }
 
@@ -4599,7 +4614,7 @@ impl State {
                 &pipeline.name,
             );
         }
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+        if p.is_none_or(pipeline_stores) {
             self.batch = None;
         }
         if let Some(p) = p
@@ -4915,7 +4930,7 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
-            self.buffers_written();
+            self.after_compute_dispatch(pipeline_stores(p));
         } else {
             self.drew(
                 list,
@@ -5609,5 +5624,899 @@ mod descriptor_cache_identity_tests {
         drop(first);
         let second = TablePlan::new(&[used(8)], &[]);
         assert_ne!(second.groups[0].reader_id, old_id);
+    }
+}
+
+#[cfg(test)]
+mod rt_indirect_batch_tests {
+    use super::{Batch, State, Window, batches};
+    use crate::host::{HostList, host, transition};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN,
+        DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory4,
+    };
+    use windows::core::{Interface, PCSTR, s};
+
+    const RT_PIPELINE_HLSL: &str = r#"
+cbuffer Scene : register(b0) {
+    uint width;
+    uint height;
+    uint enable_rt;
+    uint tile_count;
+    float4 occluder_min;
+    float4 occluder_max;
+    float4 light_dir;
+    float4 ambient_rgb;
+    uint tile_y0;
+    uint tile_y1;
+    uint marker_mode;
+    uint pad1;
+};
+
+struct RayRecord {
+    float3 origin;
+    float t_max;
+    float3 dir;
+    uint pixel;
+};
+
+float3 unpack_r9g9b9e5(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+
+uint pack_r9g9b9e5(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+
+#ifdef ACTIVATE
+#define RS "RootConstants(num32BitConstants=24, b0), UAV(u0), UAV(u1)"
+RWStructuredBuffer<RayRecord> rays : register(u0);
+RWByteAddressBuffer raw_args : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void activate_rays(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    uint idx = id.y * width + id.x;
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+    float2 world_xy = (uv * 2.0 - 1.0) * float2(8.0, 4.5);
+    RayRecord r;
+    r.origin = float3(world_xy.x, world_xy.y, 10.0);
+    r.t_max = occluder_min.w;
+    r.dir = light_dir.xyz;
+    r.pixel = idx;
+    rays[idx] = r;
+    if (id.y == 0 && id.x <= tile_count) {
+        if (id.x < tile_count) {
+            uint y0 = (id.x * height) / tile_count;
+            uint y1 = ((id.x + 1) * height) / tile_count;
+            uint gy = (y1 - y0 + 7u) / 8u;
+            uint gx = (width + 7u) / 8u;
+            raw_args.Store3(id.x * 32u, uint3(gx, gy, 1u));
+        } else {
+            // Dynamic Wave-2 slot initially inactive (0 groups).
+            raw_args.Store3(tile_count * 32u, uint3(0u, 0u, 0u));
+        }
+    }
+}
+#endif
+
+#ifdef MUTATE_ARGS
+#define RS "RootConstants(num32BitConstants=24, b0), UAV(u0)"
+RWByteAddressBuffer raw_args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void mutate_args() {
+    // Dynamically activates the Wave-2 indirect dispatch slot on GPU.
+    raw_args.Store3(tile_count * 32u, uint3(1u, 1u, 1u));
+}
+#endif
+
+#ifdef TILE_RESOLVE
+#define RS "RootConstants(num32BitConstants=24, b0), SRV(t0), DescriptorTable(UAV(u0))"
+StructuredBuffer<RayRecord> rays : register(t0);
+RWTexture2D<uint> rt_light : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void tile_resolve(uint3 id : SV_DispatchThreadID) {
+    if (marker_mode != 0u) {
+        if (id.x < 8u && id.y < 8u) {
+            // Wave-2 dynamic indirect stamp in top-left corner.
+            rt_light[id.xy] = pack_r9g9b9e5(float3(1.5, 0.25, 0.75));
+        }
+        return;
+    }
+    uint y = tile_y0 + id.y;
+    if (id.x >= width || y >= tile_y1) return;
+    uint idx = y * width + id.x;
+    RayRecord r = rays[idx];
+    float3 inv_d = 1.0 / (abs(r.dir) < 1e-6 ? float3(1e-6, 1e-6, 1e-6) : r.dir);
+    float3 t0 = (occluder_min.xyz - r.origin) * inv_d;
+    float3 t1 = (occluder_max.xyz - r.origin) * inv_d;
+    float3 tmin = min(t0, t1), tmax = max(t0, t1);
+    float enter = max(max(tmin.x, tmin.y), max(tmin.z, 0.001));
+    float exit_t = min(min(tmax.x, tmax.y), min(tmax.z, r.t_max));
+    float vis = (exit_t >= enter) ? 0.0 : 1.0;
+    float3 lit = ambient_rgb.rgb + float3(0.95, 0.90, 0.80) * light_dir.w * vis;
+    rt_light[uint2(id.x, y)] = pack_r9g9b9e5(lit);
+}
+#endif
+
+#ifdef LIGHTING_CONSUME
+#define RS "RootConstants(num32BitConstants=24, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), DescriptorTable(UAV(u1))"
+Texture2D<float> depth_tex : register(t0);
+RWTexture2D<uint> rt_light : register(u0);
+RWTexture2D<uint> final_light : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void lighting_consume(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    int2 p = int2(id.xy);
+    float d = depth_tex.Load(int3(p, 0));
+    float dl = depth_tex.Load(int3(max(p.x - 1, 0), p.y, 0));
+    float dr = depth_tex.Load(int3(min(p.x + 1, int(width) - 1), p.y, 0));
+    float du = depth_tex.Load(int3(p.x, max(p.y - 1, 0), 0));
+    float dd = depth_tex.Load(int3(p.x, min(p.y + 1, int(height) - 1), 0));
+    float edge = saturate(1.0 - 4.0 * (abs(d - dl) + abs(d - dr) + abs(d - du) + abs(d - dd)));
+    float3 base_rt = enable_rt != 0u
+        ? unpack_r9g9b9e5(rt_light[id.xy])
+        : (ambient_rgb.rgb + float3(0.95, 0.90, 0.80) * light_dir.w);
+    float3 bounce = float3(0.18, 0.16, 0.14) * edge;
+    float3 out_rgb = max(base_rt * (0.85 + 0.15 * edge), bounce * 0.25);
+    final_light[id.xy] = pack_r9g9b9e5(out_rgb);
+}
+#endif
+"#;
+
+    fn unpack_r9g9b9e5(v: u32) -> [f32; 3] {
+        let scale = 2.0f32.powi((v >> 27) as i32 - 24);
+        [
+            (v & 511) as f32 * scale,
+            ((v >> 9) & 511) as f32 * scale,
+            ((v >> 18) & 511) as f32 * scale,
+        ]
+    }
+
+    fn uav_barrier_for(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(resource.cloned()),
+                }),
+            },
+        }
+    }
+
+    fn compile_stage(
+        device: &ID3D12Device,
+        def: &str,
+        entry: PCSTR,
+    ) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let code =
+            crate::host::compile(&format!("#define {def}\n{RT_PIPELINE_HLSL}"), entry, s!("cs_5_1"))
+                .expect("RT pass shader must compile");
+        // SAFETY: embedded root signature in compiled DXBC blob.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).unwrap();
+            let pso = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    fn adapter_name() -> String {
+        // SAFETY: plain DXGI adapter enumeration.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return "unknown".to_owned();
+            };
+            for i in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+                let Ok(desc) = adapter.GetDesc1() else { continue };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                return String::from_utf16_lossy(&desc.Description[..len]);
+            }
+            "WARP".to_owned()
+        }
+    }
+
+    /// Texture-only / read-only compute dispatches (`stores == false`) must keep
+    /// any open indirect clamp batch and window alive; buffer-writing compute
+    /// dispatches (`stores == true`) must invalidate them so subsequent indirect
+    /// executions wait and re-clamp newly written arguments.
+    #[test]
+    fn non_storing_compute_preserves_batch_and_window_while_storing_clears() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src, _)) = host.shared_buffer(4096) else {
+            return;
+        };
+        let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[]).unwrap();
+        let mut state = State::default();
+        state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        state.window = Some(Window {
+            copy: 1,
+            kind: 2,
+            stride: 12,
+            step: 32,
+            base: 0,
+            records: 16,
+            scratch,
+        });
+
+        for _ in 0..64 {
+            state.after_compute_dispatch(false);
+        }
+        assert!(state.batch.is_some(), "non-storing compute dispatches must preserve open batch");
+        assert!(!state.batch.as_ref().unwrap().wrote, "non-storing compute must not mark batch dirty");
+        assert!(state.window.is_some(), "non-storing compute dispatches must preserve window");
+
+        state.after_compute_dispatch(true);
+        assert!(state.window.is_none(), "buffer-writing compute must invalidate window");
+        if batches() == 2 {
+            assert!(state.batch.as_ref().is_some_and(|b| b.wrote));
+            state.synced();
+        }
+        assert!(state.batch.is_none(), "buffer-writing compute must invalidate batch");
+
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// Confirms that `pipeline::stores` (which populates `translated().stores`)
+    /// returns `true` for compute shaders whose only memory write is a buffer,
+    /// global, flat, or scalar atomic add (and `false` for texture-only or
+    /// read-only shaders), and that dispatching an atomic-only compute shader
+    /// clears both the open indirect clamp batch and window.
+    #[test]
+    fn atomic_only_compute_shader_marks_stores_and_clears_batch() {
+        use victory_shader::gfx10::decode;
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        let program = |words: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+
+        let atomic_cases: &[(&str, [u32; 3])] = &[
+            // Encoding::Mubuf (0x38), opcode 0x032 = buffer_atomic_add
+            ("buffer_atomic_add", [(0x38 << 26) | (0x32 << 18), 0, S_ENDPGM]),
+            // Encoding::Global (0x37, seg 2), opcode 0x032 = global_atomic_add
+            ("global_atomic_add", [(0x37 << 26) | (0x32 << 18) | (2 << 14), 0, S_ENDPGM]),
+            // Encoding::Flat (0x37, seg 0), opcode 0x032 = flat_atomic_add
+            ("flat_atomic_add", [(0x37 << 26) | (0x32 << 18), 0, S_ENDPGM]),
+            // Encoding::Smem (0x3D), opcode 0x042 = s_buffer_atomic_add
+            ("s_buffer_atomic_add", [(0x3D << 26) | (0x42 << 18), 0, S_ENDPGM]),
+            // Encoding::Smem (0x3D), opcode 0x082 = s_atomic_add
+            ("s_atomic_add", [(0x3D << 26) | (0x82 << 18), 0, S_ENDPGM]),
+        ];
+        for &(expected_name, words) in atomic_cases {
+            let prog = program(&words);
+            let decoded = decode(&prog.code).expect("valid GFX10 instruction");
+            assert_eq!(decoded[0].name(), Some(expected_name));
+            assert!(
+                crate::pipeline::stores(&prog),
+                "{expected_name} must mark translated().stores = true"
+            );
+        }
+
+        // Texture-only MIMG store (image_store, opcode 0x008) and read-only CS
+        // cannot modify indirect argument buffers, so `stores` stays false.
+        let tex_only = program(&[(0x3C << 26) | (0x08 << 18), 0, S_ENDPGM]);
+        assert_eq!(decode(&tex_only.code).unwrap()[0].name(), Some("image_store"));
+        assert!(!crate::pipeline::stores(&tex_only), "texture-only image_store must not mark buffer stores");
+        let read_only = program(&[S_ENDPGM]);
+        assert!(!crate::pipeline::stores(&read_only), "read-only compute must not mark buffer stores");
+
+        // End-to-end state transition: an atomic-only compute dispatch clears
+        // the open clamp batch and window just like a plain buffer store.
+        let Some(host) = host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src, _)) = host.shared_buffer(4096) else {
+            return;
+        };
+        for &(expected_name, words) in atomic_cases {
+            let prog = program(&words);
+            let (table, scratch) = crate::indirect::open_batch(&list, (1, &src), &[]).unwrap();
+            let mut state = State::default();
+            state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+            state.window = Some(Window {
+                copy: 1,
+                kind: 2,
+                stride: 12,
+                step: 32,
+                base: 0,
+                records: 16,
+                scratch,
+            });
+            state.after_compute_dispatch(crate::pipeline::stores(&prog));
+            assert!(state.window.is_none(), "{expected_name} must clear open indirect window");
+            if batches() == 2 {
+                assert!(state.batch.as_ref().is_some_and(|b| b.wrote));
+                state.synced();
+            }
+            assert!(state.batch.is_none(), "{expected_name} must clear open indirect batch");
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    struct RtFrameResult {
+        adapter: String,
+        batches_per_frame: u32,
+        rt_gpu_p50: f64,
+        rt_gpu_p95: f64,
+        light_gpu_p50: f64,
+        total_gpu_p50: f64,
+        total_gpu_p95: f64,
+        wall_p50: f64,
+        wall_p95: f64,
+        pixels: Vec<u32>,
+    }
+
+    fn run_rt_tile_frame(
+        width: u32,
+        height: u32,
+        tile_count: u32,
+        enable_rt: bool,
+        occluder_right: bool,
+        dynamic_wave2: bool,
+        force_break_every_dispatch: bool,
+        warmups: usize,
+        iters: usize,
+        read_pixels: bool,
+    ) -> Option<RtFrameResult> {
+        let host = host()?;
+        let device = &host.device;
+        let list = host.new_list().ok()?;
+
+        let make_buf = |bytes: u64, heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> Option<ID3D12Resource> {
+            let mut res: Option<ID3D12Resource> = None;
+            // SAFETY: plain committed buffer creation.
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes.max(256),
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_UNKNOWN,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut res,
+                    )
+                    .ok()?;
+            }
+            res
+        };
+        let make_tex = |w: u32, h: u32, format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> Option<ID3D12Resource> {
+            let mut res: Option<ID3D12Resource> = None;
+            // SAFETY: plain committed texture creation.
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: u64::from(w),
+                            Height: h,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut res,
+                    )
+                    .ok()?;
+            }
+            res
+        };
+
+        let activate = compile_stage(device, "ACTIVATE", s!("activate_rays"));
+        let mutate = compile_stage(device, "MUTATE_ARGS", s!("mutate_args"));
+        let tile_resolve = compile_stage(device, "TILE_RESOLVE", s!("tile_resolve"));
+        let consume = compile_stage(device, "LIGHTING_CONSUME", s!("lighting_consume"));
+
+        // SAFETY: plain D3D12 command signature, timestamp query heap, resources, and descriptors.
+        unsafe {
+            let tmp_queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .ok()?;
+            let ts_freq = tmp_queue.GetTimestampFrequency().unwrap_or(1).max(1);
+
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            };
+            let mut dispatch_sig: Option<ID3D12CommandSignature> = None;
+            device
+                .CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 12,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &arg,
+                        NodeMask: 0,
+                    },
+                    None::<&ID3D12RootSignature>,
+                    &mut dispatch_sig,
+                )
+                .ok()?;
+            let dispatch_sig = dispatch_sig?;
+
+            let pixels = u64::from(width) * u64::from(height);
+            let rays = host.uav_buffer(pixels * 32)?;
+            let raw_args = host.uav_buffer(u64::from(tile_count + 2) * 32)?;
+            let depth_tex = make_tex(width, height, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+            let rt_light_tex = make_tex(width, height, DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+            let final_light_tex = make_tex(width, height, DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+
+            let row_pitch = (width * 4).next_multiple_of(256);
+            let depth_up = make_buf(u64::from(row_pitch) * u64::from(height), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+            let readback = make_buf(u64::from(row_pitch) * u64::from(height), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            depth_up.Map(0, None, Some(&mut ptr)).ok()?;
+            for y in 0..height {
+                let row = ptr.cast::<u8>().add((y * row_pitch) as usize).cast::<f32>();
+                for x in 0..width {
+                    let occ = if occluder_right {
+                        x >= (width * 9) / 16 && x < (width * 13) / 16 && y >= height / 4 && y < (3 * height) / 4
+                    } else {
+                        x >= (width * 3) / 16 && x < (width * 7) / 16 && y >= height / 4 && y < (3 * height) / 4
+                    };
+                    let z = if occ { 3.5f32 } else { 10.0 + (x as f32 / width as f32) * 6.0 };
+                    *row.add(x as usize) = 0.1 / z;
+                }
+            }
+            depth_up.Unmap(0, None);
+
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            let inc = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let cpu = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap.GetCPUDescriptorHandleForHeapStart().ptr + (i * inc) as usize };
+            let gpu = |i: u32| D3D12_GPU_DESCRIPTOR_HANDLE { ptr: heap.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(i * inc) };
+
+            device.CreateShaderResourceView(
+                &depth_tex,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_FLOAT,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                    },
+                }),
+                cpu(0),
+            );
+            for (slot, tex) in [(1, &rt_light_tex), (2, &final_light_tex)] {
+                device.CreateUnorderedAccessView(
+                    tex,
+                    None,
+                    Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+                        },
+                    }),
+                    cpu(slot),
+                );
+            }
+
+            let mut ts_heap: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 4, NodeMask: 0 },
+                    &mut ts_heap,
+                )
+                .ok()?;
+            let ts_heap = ts_heap?;
+            let ts_rb = make_buf(32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+
+            let footprint = |res: &ID3D12Resource, format: DXGI_FORMAT| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::ManuallyDrop::new(Some(res.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format,
+                            Width: width,
+                            Height: height,
+                            Depth: 1,
+                            RowPitch: row_pitch,
+                        },
+                    },
+                },
+            };
+            let sub0 = |res: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::ManuallyDrop::new(Some(res.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+
+            // Upload depth texture once.
+            list.list.CopyTextureRegion(&sub0(&depth_tex), 0, 0, 0, &footprint(&depth_up, DXGI_FORMAT_R32_FLOAT), None);
+            list.list.ResourceBarrier(&[transition(&depth_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+
+            let (occ_min, occ_max) = if occluder_right {
+                ([1.0f32, -2.25, 4.0], [5.0f32, 2.25, 5.0])
+            } else {
+                ([-5.0f32, -2.25, 4.0], [-1.0f32, 2.25, 5.0])
+            };
+            let mut scene: [u32; 24] = [
+                width, height, u32::from(enable_rt), tile_count,
+                occ_min[0].to_bits(), occ_min[1].to_bits(), occ_min[2].to_bits(), 20.0f32.to_bits(),
+                occ_max[0].to_bits(), occ_max[1].to_bits(), occ_max[2].to_bits(), 0,
+                0.0f32.to_bits(), 0.0f32.to_bits(), (-1.0f32).to_bits(), 2.0f32.to_bits(),
+                0.08f32.to_bits(), 0.08f32.to_bits(), 0.08f32.to_bits(), 0,
+                0, 0, 0, 0,
+            ];
+
+            let mut state = State::default();
+            let place_in_batch = |state: &mut State, list: &HostList, offset: u64, opened: &mut u32| -> (ID3D12Resource, u64) {
+                const BATCH_USE: usize = usize::MAX - 0x78;
+                if list.first_use(BATCH_USE) {
+                    state.batch = None;
+                }
+                if let Some(b) = &mut state.batch
+                    && let Some(at) = b.table.place(1, offset, 2)
+                {
+                    return (b.scratch.clone(), at);
+                }
+                state.batch = None;
+                let (mut table, scratch) = crate::indirect::open_batch(list, (1, &raw_args), &[]).unwrap();
+                *opened += 1;
+                state.host_pipeline = 0;
+                state.host_roots[1] = 0;
+                let at = table.place(1, offset, 2).unwrap();
+                state.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+                (scratch, at)
+            };
+
+            let mut run_one = |do_readback: bool| -> (u32, [f64; 3], f64, Vec<u32>) {
+                let wall_start = std::time::Instant::now();
+                let mut opened = 0u32;
+                let l = &list.list;
+                let heaps = [Some(heap.clone())];
+                l.SetDescriptorHeaps(&heaps);
+
+                l.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                if enable_rt {
+                    // 1. ActivateRays (`stores = true`): writes rays + indirect dispatch args.
+                    l.SetComputeRootSignature(&activate.0);
+                    l.SetPipelineState(&activate.1);
+                    scene[20] = 0;
+                    scene[21] = height;
+                    scene[22] = 0;
+                    l.SetComputeRoot32BitConstants(0, 24, scene.as_ptr().cast(), 0);
+                    l.SetComputeRootUnorderedAccessView(1, rays.GetGPUVirtualAddress());
+                    l.SetComputeRootUnorderedAccessView(2, raw_args.GetGPUVirtualAddress());
+                    l.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+                    state.after_compute_dispatch(true);
+
+                    l.ResourceBarrier(&[
+                        transition(&rays, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                        transition(&raw_args, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    ]);
+
+                    // 2. Tile-class indirect RayTrace + Resolve (`stores = false`, writes RWTexture2D only).
+                    for tile in 0..tile_count {
+                        let (scratch, at) = place_in_batch(&mut state, &list, u64::from(tile) * 32, &mut opened);
+                        let root_raw = tile_resolve.0.as_raw() as usize;
+                        let pso_raw = tile_resolve.1.as_raw() as usize;
+                        if state.host_roots[1] != root_raw {
+                            l.SetComputeRootSignature(&tile_resolve.0);
+                            state.host_roots[1] = root_raw;
+                        }
+                        if state.host_pipeline != pso_raw {
+                            l.SetPipelineState(&tile_resolve.1);
+                            state.host_pipeline = pso_raw;
+                        }
+                        scene[20] = (tile * height) / tile_count;
+                        scene[21] = ((tile + 1) * height) / tile_count;
+                        scene[22] = 0;
+                        l.SetComputeRoot32BitConstants(0, 24, scene.as_ptr().cast(), 0);
+                        l.SetComputeRootShaderResourceView(1, rays.GetGPUVirtualAddress());
+                        l.SetComputeRootDescriptorTable(2, gpu(1));
+                        l.ExecuteIndirect(&dispatch_sig, 1, &scratch, at, None, 0);
+                        if force_break_every_dispatch {
+                            state.buffers_written();
+                        } else {
+                            state.after_compute_dispatch(false);
+                        }
+                    }
+
+                    // 3. Optional dynamic Wave-2 producer-consumer verification:
+                    //    a buffer-writing dispatch mutates slot `tile_count` on GPU;
+                    //    `after_compute_dispatch(true)` MUST close the batch so the
+                    //    next indirect dispatch re-clamps the updated count.
+                    if dynamic_wave2 {
+                        l.ResourceBarrier(&[transition(&raw_args, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                        l.SetComputeRootSignature(&mutate.0);
+                        l.SetPipelineState(&mutate.1);
+                        l.SetComputeRoot32BitConstants(0, 24, scene.as_ptr().cast(), 0);
+                        l.SetComputeRootUnorderedAccessView(1, raw_args.GetGPUVirtualAddress());
+                        l.Dispatch(1, 1, 1);
+                        state.after_compute_dispatch(true);
+                        state.host_pipeline = 0;
+                        state.host_roots[1] = 0;
+
+                        l.ResourceBarrier(&[transition(&raw_args, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                        let (scratch, at) = place_in_batch(&mut state, &list, u64::from(tile_count) * 32, &mut opened);
+                        l.SetComputeRootSignature(&tile_resolve.0);
+                        l.SetPipelineState(&tile_resolve.1);
+                        scene[22] = 1;
+                        l.SetComputeRoot32BitConstants(0, 24, scene.as_ptr().cast(), 0);
+                        l.SetComputeRootShaderResourceView(1, rays.GetGPUVirtualAddress());
+                        l.SetComputeRootDescriptorTable(2, gpu(1));
+                        l.ExecuteIndirect(&dispatch_sig, 1, &scratch, at, None, 0);
+                        state.after_compute_dispatch(false);
+                        scene[22] = 0;
+                    }
+
+                    l.ResourceBarrier(&[
+                        uav_barrier_for(Some(&rt_light_tex)),
+                        transition(&rays, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        transition(&raw_args, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    ]);
+                }
+                l.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+                // 4. Lighting consumption pass (reads RT R9G9B9E5 + depth -> final R9G9B9E5).
+                l.SetComputeRootSignature(&consume.0);
+                l.SetPipelineState(&consume.1);
+                scene[20] = 0;
+                scene[21] = height;
+                scene[22] = 0;
+                l.SetComputeRoot32BitConstants(0, 24, scene.as_ptr().cast(), 0);
+                l.SetComputeRootDescriptorTable(1, gpu(0));
+                l.SetComputeRootDescriptorTable(2, gpu(1));
+                l.SetComputeRootDescriptorTable(3, gpu(2));
+                l.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+                l.ResourceBarrier(&[uav_barrier_for(Some(&final_light_tex))]);
+                state.host_pipeline = 0;
+                state.host_roots[1] = 0;
+                l.EndQuery(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+
+                l.ResolveQueryData(&ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, &ts_rb, 0);
+                if do_readback {
+                    l.ResourceBarrier(&[transition(&final_light_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    l.CopyTextureRegion(&footprint(&readback, DXGI_FORMAT_R32_UINT), 0, 0, 0, &sub0(&final_light_tex), None);
+                    l.ResourceBarrier(&[transition(&final_light_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                }
+                list.close();
+                host.execute(&[&list]);
+                let wall_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+                list.reset();
+
+                let mut ts = [0u64; 3];
+                ts_rb.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(ptr.cast::<u64>(), ts.as_mut_ptr(), 3);
+                ts_rb.Unmap(0, None);
+                let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * 1000.0 / ts_freq as f64;
+                let gpu_ms = [ms(ts[0], ts[1]), ms(ts[1], ts[2]), ms(ts[0], ts[2])];
+
+                let mut out = Vec::new();
+                if do_readback {
+                    out.resize((width * height) as usize, 0);
+                    readback.Map(0, None, Some(&mut ptr)).unwrap();
+                    for y in 0..height as usize {
+                        let row = ptr.cast::<u8>().add(y * row_pitch as usize).cast::<u32>();
+                        std::ptr::copy_nonoverlapping(row, out.as_mut_ptr().add(y * width as usize), width as usize);
+                    }
+                    readback.Unmap(0, None);
+                }
+                (opened, gpu_ms, wall_ms, out)
+            };
+
+            for _ in 0..warmups {
+                run_one(false);
+            }
+            let mut rt_cols = Vec::with_capacity(iters);
+            let mut light_cols = Vec::with_capacity(iters);
+            let mut total_cols = Vec::with_capacity(iters);
+            let mut walls = Vec::with_capacity(iters);
+            let mut last_opened = 0u32;
+            for _ in 0..iters {
+                let (opened, g, w, _) = run_one(false);
+                last_opened = opened;
+                rt_cols.push(g[0]);
+                light_cols.push(g[1]);
+                total_cols.push(g[2]);
+                walls.push(w);
+            }
+            let (_, _, _, pixels) = if read_pixels {
+                run_one(true)
+            } else {
+                (0, [0.0; 3], 0.0, Vec::new())
+            };
+            assert_eq!(host.log_messages(), None, "D3D12 debug layer reported an error");
+
+            let pct = |mut v: Vec<f64>, p: f64| -> f64 {
+                v.sort_by(|a, b| a.total_cmp(b));
+                let idx = ((v.len() as f64 * p).ceil() as usize).saturating_sub(1).min(v.len() - 1);
+                v[idx]
+            };
+            Some(RtFrameResult {
+                adapter: adapter_name(),
+                batches_per_frame: last_opened,
+                rt_gpu_p50: pct(rt_cols.clone(), 0.50),
+                rt_gpu_p95: pct(rt_cols, 0.95),
+                light_gpu_p50: pct(light_cols, 0.50),
+                total_gpu_p50: pct(total_cols.clone(), 0.50),
+                total_gpu_p95: pct(total_cols, 0.95),
+                wall_p50: pct(walls.clone(), 0.50),
+                wall_p95: pct(walls, 0.95),
+                pixels,
+            })
+        }
+    }
+
+    /// End-to-end D3D12 test from `ActivateRays` through 64 tile-class indirect
+    /// `RayTrace/Resolve` dispatches, dynamic producer-consumer argument update,
+    /// and fullscreen lighting consumption:
+    /// 1. 64 texture-only tile-class indirect dispatches share 1 clamp batch
+    ///    (plus 1 fresh batch after Wave-2 buffer mutation = 2 total, vs 65).
+    /// 2. Moving the occluder shifts the shadow in final resolved `R9G9B9E5` light.
+    /// 3. Wave-2 dynamic indirect dispatch executes with newly written GPU args.
+    /// 4. Final `R9G9B9E5` output is bit-exact against closing the batch after every dispatch.
+    #[test]
+    fn rt_tile_classes_movable_occluder_and_dynamic_args_visibility() {
+        let Some(left_opt) = run_rt_tile_frame(320, 180, 64, true, false, true, false, 1, 1, true)
+        else {
+            return;
+        };
+        let right_opt = run_rt_tile_frame(320, 180, 64, true, true, true, false, 1, 1, true).unwrap();
+        let left_legacy = run_rt_tile_frame(320, 180, 64, true, false, true, true, 1, 1, true).unwrap();
+
+        assert_eq!(left_opt.batches_per_frame, 2, "64 non-storing dispatches + 1 dynamic wave = 2 batches");
+        assert_eq!(left_legacy.batches_per_frame, 65, "legacy breaks batch on every dispatch");
+        assert_eq!(left_opt.pixels, left_legacy.pixels, "batched output must be bit-exact with legacy");
+        assert_ne!(left_opt.pixels, right_opt.pixels, "moving occluder must change final lighting");
+
+        let luma = |px: &[u32], x: u32, y: u32| -> f32 {
+            let rgb = unpack_r9g9b9e5(px[(y * 320 + x) as usize]);
+            0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+        };
+        let (l_a, r_a) = (luma(&left_opt.pixels, 96, 90), luma(&left_opt.pixels, 224, 90));
+        let (l_b, r_b) = (luma(&right_opt.pixels, 96, 90), luma(&right_opt.pixels, 224, 90));
+        assert!(l_a * 3.0 < r_a, "occluder left should shadow left ({l_a}) vs right ({r_a})");
+        assert!(r_b * 3.0 < l_b, "occluder right should shadow right ({r_b}) vs left ({l_b})");
+
+        // Verify Wave-2 dynamic indirect stamp at (2, 2): strong red/blue tint (> 1.0, < 0.4, > 0.5).
+        let stamp = unpack_r9g9b9e5(left_opt.pixels[2 * 320 + 2]);
+        assert!(
+            stamp[0] > 1.0 && stamp[1] < 0.4 && stamp[2] > 0.5,
+            "Wave-2 producer-consumer indirect stamp missing: {stamp:?}"
+        );
+    }
+
+    /// Full-frame 1080p RT OFF vs RT ON and tile-class indirect batching benchmark
+    /// (64 and 92 tile-class indirect dispatches, 2,073,600 rays/frame, 33.333 ms
+    /// 30 FPS budget). Run with:
+    /// `cargo test -p victory-gpu --release --lib draw::rt_indirect_batch_tests::rt_tile_class_full_frame_bench -- --exact --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn rt_tile_class_full_frame_bench() {
+        const BUDGET_MS: f64 = 33.333;
+        const WARMUP: usize = 24;
+        const ITERS: usize = 60;
+        let to_bytes = |words: &[u32]| -> &[u8] {
+            // SAFETY: `&[u32]` has valid initialized bytes of length `words.len() * 4`.
+            unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
+        };
+        for tiles in [64u32, 92u32] {
+            let rt_off = run_rt_tile_frame(1920, 1080, tiles, false, false, false, false, WARMUP, ITERS, false).unwrap();
+            let rt_on_legacy = run_rt_tile_frame(1920, 1080, tiles, true, false, false, true, WARMUP, ITERS, true).unwrap();
+            let rt_on_opt = run_rt_tile_frame(1920, 1080, tiles, true, false, false, false, WARMUP, ITERS, true).unwrap();
+            let rt_on_right = run_rt_tile_frame(1920, 1080, tiles, true, true, false, false, 2, 2, true).unwrap();
+
+            assert_eq!(rt_on_opt.pixels, rt_on_legacy.pixels, "bit-exact parity required");
+            assert_ne!(rt_on_opt.pixels, rt_on_right.pixels, "moving occluder must change output");
+            let hash_left = blake3::hash(to_bytes(&rt_on_opt.pixels)).to_hex();
+            let hash_right = blake3::hash(to_bytes(&rt_on_right.pixels)).to_hex();
+
+            println!(
+                "adapter={} res=1920x1080 rays=2073600 tiles={tiles} budget_30fps={BUDGET_MS:.3}ms diff_px=0/2073600",
+                rt_on_opt.adapter
+            );
+            println!(
+                "RT_OFF        batches={} rt_gpu_p50/p95={:.4}/{:.4}ms light_gpu_p50={:.4}ms total_gpu_p50/p95={:.4}/{:.4}ms ({:.2}% of 33.3ms) wall_p50/p95={:.3}/{:.3}ms",
+                rt_off.batches_per_frame, rt_off.rt_gpu_p50, rt_off.rt_gpu_p95, rt_off.light_gpu_p50,
+                rt_off.total_gpu_p50, rt_off.total_gpu_p95, rt_off.total_gpu_p50 / BUDGET_MS * 100.0,
+                rt_off.wall_p50, rt_off.wall_p95
+            );
+            println!(
+                "RT_ON_LEGACY  batches={} rt_gpu_p50/p95={:.4}/{:.4}ms light_gpu_p50={:.4}ms total_gpu_p50/p95={:.4}/{:.4}ms ({:.2}% of 33.3ms) wall_p50/p95={:.3}/{:.3}ms",
+                rt_on_legacy.batches_per_frame, rt_on_legacy.rt_gpu_p50, rt_on_legacy.rt_gpu_p95, rt_on_legacy.light_gpu_p50,
+                rt_on_legacy.total_gpu_p50, rt_on_legacy.total_gpu_p95, rt_on_legacy.total_gpu_p50 / BUDGET_MS * 100.0,
+                rt_on_legacy.wall_p50, rt_on_legacy.wall_p95
+            );
+            println!(
+                "RT_ON_OPT     batches={} rt_gpu_p50/p95={:.4}/{:.4}ms light_gpu_p50={:.4}ms total_gpu_p50/p95={:.4}/{:.4}ms ({:.2}% of 33.3ms) wall_p50/p95={:.3}/{:.3}ms",
+                rt_on_opt.batches_per_frame, rt_on_opt.rt_gpu_p50, rt_on_opt.rt_gpu_p95, rt_on_opt.light_gpu_p50,
+                rt_on_opt.total_gpu_p50, rt_on_opt.total_gpu_p95, rt_on_opt.total_gpu_p50 / BUDGET_MS * 100.0,
+                rt_on_opt.wall_p50, rt_on_opt.wall_p95
+            );
+            println!(
+                "SUMMARY       rt_overhead_gpu={:+.4}ms ({:.2}% of 33.3ms) | opt_rt_gpu={:+.4}ms ({:+.1}%) opt_total_gpu={:+.4}ms ({:+.1}%) opt_wall={:+.3}ms ({:+.1}%)",
+                rt_on_opt.total_gpu_p50 - rt_off.total_gpu_p50,
+                (rt_on_opt.total_gpu_p50 - rt_off.total_gpu_p50) / BUDGET_MS * 100.0,
+                rt_on_opt.rt_gpu_p50 - rt_on_legacy.rt_gpu_p50,
+                (1.0 - rt_on_opt.rt_gpu_p50 / rt_on_legacy.rt_gpu_p50) * 100.0,
+                rt_on_opt.total_gpu_p50 - rt_on_legacy.total_gpu_p50,
+                (1.0 - rt_on_opt.total_gpu_p50 / rt_on_legacy.total_gpu_p50) * 100.0,
+                rt_on_opt.wall_p50 - rt_on_legacy.wall_p50,
+                (1.0 - rt_on_opt.wall_p50 / rt_on_legacy.wall_p50) * 100.0,
+            );
+            println!("hashes left={} right={}", &hash_left[..16], &hash_right[..16]);
+        }
     }
 }
