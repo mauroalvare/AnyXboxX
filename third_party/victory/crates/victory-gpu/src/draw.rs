@@ -3049,6 +3049,25 @@ impl State {
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
             // the new one shows has run.
+            // (Neptune) Bindless usage feedback: a slot of a texture the eviction let go while no
+            // shader read it is parked too, not made, unless a shader read this very slot since
+            // (the queue comes to such slots when the title writes them again or the texture's
+            // memory changes, with no shader asking: that was nearly every texture made again).
+            if crate::feedback::on()
+                && let Some(handle) = heap.handle(index)
+                && let Some(seen) = crate::descriptor::view(handle)
+            {
+                let placed = crate::descriptor::host::placed_texture(&seen);
+                if let Some(&View::Shader(texture, _)) = placed.as_ref().or(Some(&seen))
+                    && let Some(went) = crate::resource::unread_evicted(texture as This)
+                    && !crate::feedback::seen_since(index, went)
+                    && host.park_at(index, handle)
+                {
+                    host.texture_slot_done(index, write, None);
+                    crate::feedback::STATS[3].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
             let sync_bake = sync.is_some();
             let shows_other = !baking
                 && !sync_bake

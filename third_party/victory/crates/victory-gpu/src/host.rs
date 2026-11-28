@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1676,6 +1676,11 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: this fence belongs to the live host queue.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
@@ -2124,7 +2129,7 @@ pub(crate) fn closed_for_execution(runs: &[&HostList]) -> usize {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Whether the underlying D3D12 list is open for recording.
@@ -2155,7 +2160,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<budget_pool::Budget>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
@@ -2878,17 +2883,19 @@ fn scratch_pool() -> bool {
 struct Spare<T> {
     kept: Vec<(T, u64)>,
     bytes: u64,
+    low: u64,
 }
 
 impl<T> Spare<T> {
     const fn new() -> Self {
-        Spare { kept: Vec::new(), bytes: 0 }
+        Spare { kept: Vec::new(), bytes: 0, low: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
         let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
         self.bytes -= size;
+        self.low = self.low.min(self.bytes);
         Some(self.kept.remove(at).0)
     }
 
@@ -2901,6 +2908,66 @@ impl<T> Spare<T> {
         self.bytes += size;
         self.kept.push((thing, size));
         None
+    }
+
+    fn trim(&mut self) -> Vec<(T, u64)> {
+        let mut freed = Vec::new();
+        let mut remaining = self.low;
+        while let Some(at) = self.kept.iter().position(|(_, size)| *size <= remaining) {
+            let entry = self.kept.remove(at);
+            remaining -= entry.1;
+            self.bytes -= entry.1;
+            freed.push(entry);
+        }
+        self.low = self.bytes;
+        freed
+    }
+}
+
+fn allocator_trim_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn allocator_trim_seconds() -> Option<u64> {
+    static SECONDS: OnceLock<Option<u64>> = OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        allocator_trim_enabled().then(|| {
+            std::env::var("VICTORY_ALLOCATOR_TRIM_S")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(30)
+                .clamp(5, 3600)
+        })
+    })
+}
+
+fn allocator_old_enough(created: u64, now: u64, seconds: u64) -> bool {
+    now.saturating_sub(created) >= seconds * 1000
+}
+
+fn refresh_allocator(slot: &mut (ID3D12CommandAllocator, u64)) -> bool {
+    let Some(seconds) = allocator_trim_seconds() else { return false };
+    refresh_allocator_at(slot, now_ms(), seconds)
+}
+
+fn refresh_allocator_at(slot: &mut (ID3D12CommandAllocator, u64), now: u64, seconds: u64) -> bool {
+    if !allocator_old_enough(slot.1, now, seconds) {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    // SAFETY: creating a direct allocator on the live device.
+    let made = unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) };
+    match made {
+        Ok(allocator) => {
+            let old = std::mem::replace(slot, (allocator, now));
+            retire(old.0);
+            true
+        }
+        Err(_) => {
+            slot.1 = now;
+            false
+        }
     }
 }
 
@@ -3288,6 +3355,23 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
             }
         }
     }
+    if allocator_trim_enabled() {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 10_000
+            && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            let trimmed = SPARE.lock().unwrap_or_else(|e| e.into_inner()).trim();
+            for (chunk, size) in trimmed {
+                ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+                freed.push(chunk);
+            }
+        }
+    }
     // Freed outside the lock.
     drop(freed);
 }
@@ -3300,6 +3384,7 @@ fn trim_spare_chunks() {
             return;
         }
         spare.bytes = 0;
+        spare.low = 0;
         std::mem::take(&mut spare.kept)
     };
     let count = freed.len() as u64;
@@ -3571,6 +3656,7 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a title copy intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    GpuTexture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::detile::Upload>),
     /// Reads a CPU-written linear movie plane into a per-list upload buffer.
     Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
@@ -4481,7 +4567,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging) | Step::GpuTexture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -5395,6 +5481,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod mapping_fence;
 mod prelude_pool;
+mod budget_pool;
 mod title_stock;
 mod card_steps;
 pub(crate) mod indirects;
@@ -5873,7 +5960,7 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new((allocator, now_ms())),
                 list: rec::Rec::new(list),
                 recording: Recording::open(),
                 deferred: Mutex::default(),
@@ -7666,6 +7753,33 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush(None);
+        // (Neptune) Bindless usage feedback (`crate::feedback`): its copy and clear, first.
+        if crate::detile::on()
+            && let Some(pre) = crate::detile::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+            }
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
+        if crate::feedback::on()
+            && let Some(pre) = crate::feedback::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+            }
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         #[cfg(feature = "diagnostics")]
         split.part(2);
@@ -7763,6 +7877,10 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if crate::detile::on() { crate::detile::sent(*submitted); }
+            if crate::feedback::on() {
+                crate::feedback::sent(*submitted);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -7881,6 +7999,8 @@ impl Host {
             }
         }
         mark_frame_preparations(runs);
+        if crate::detile::on() { crate::detile::sent(*submitted); }
+        if crate::feedback::on() { crate::feedback::sent(*submitted); }
         let _ = &firsts;
         let fence = *submitted;
         FINISHED.store(this_submission, Ordering::Release);
@@ -8463,11 +8583,12 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = refresh_allocator(&mut allocator);
+        // SAFETY: the list is not executing; a fresh allocator needs no reset.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            (if fresh { Ok(()) } else { allocator.0.Reset() })
+                .and_then(|()| self.list.Reset(&allocator.0, None))
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
@@ -9172,18 +9293,12 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let budget = self.budget.get_or_init(|| budget_pool::Budget::new(card_budget())).as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = budget.data();
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -9208,8 +9323,8 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        // SAFETY: the card buffer, if present, remains owned by this list.
+        Some(card.map_or_else(|| budget.gpu(), |buffer| unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -9261,10 +9376,13 @@ impl HostList {
         if !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
+        let (Some(Some(card)), Some(Some(budget))) =
             (self.card_budget.get(), self.budget.get())
         else {
             return;
+        };
+        let Some(mapped) = budget.own_buffer() else {
+            fail(format_args!("a card budget cannot use a packed mapped buffer"));
         };
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
@@ -9508,6 +9626,11 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    pub(crate) fn defer_gpu_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, upload: std::sync::Arc<crate::detile::Upload>) {
+        self.deferred().copies.push(Step::GpuTexture(staging, upload));
+    }
+
+
     /// A copy source owned exclusively by this list until reset after its
     /// last execution. A different list can prepare its movie plane concurrently.
     pub(crate) fn plane_upload(
@@ -9653,6 +9776,11 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::GpuTexture(staging, upload) => {
+                    batch.texture_due(staging);
+                    staging.gpu_fill(upload);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -12936,7 +13064,42 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{Spare, allocator_old_enough, refresh_allocator_at};
+
+    #[test]
+    fn allocator_age_requires_the_whole_interval() {
+        assert!(!allocator_old_enough(100, 99, 30));
+        assert!(!allocator_old_enough(100, 30_099, 30));
+        assert!(allocator_old_enough(100, 30_100, 30));
+    }
+
+    #[test]
+    fn allocator_is_replaced_only_after_the_interval() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else { return };
+        let Some((allocator, _list)) = host.make_prelude() else { return };
+        let mut slot = (allocator, 100);
+        let original = slot.0.as_raw();
+        assert!(!refresh_allocator_at(&mut slot, 30_099, 30));
+        assert_eq!(slot.0.as_raw(), original);
+        assert!(refresh_allocator_at(&mut slot, 30_100, 30));
+        assert_ne!(slot.0.as_raw(), original);
+        assert_eq!(slot.1, 30_100);
+    }
+
+    #[test]
+    fn a_trim_frees_only_what_was_never_asked_for_since_the_last() {
+        let mut spare = Spare::new();
+        for thing in 1..=3 {
+            assert_eq!(spare.give(thing, 4, 100), None);
+        }
+        assert!(spare.trim().is_empty());
+        assert_eq!(spare.take(4), Some(3));
+        assert_eq!(spare.give(3, 4, 100), None);
+        assert_eq!(spare.trim(), vec![(1, 4), (2, 4)]);
+        assert_eq!(spare.bytes, 4);
+        assert_eq!(spare.take(4), Some(3));
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.

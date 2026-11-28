@@ -57,7 +57,7 @@ Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : l
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/ea488a9f9901e4375c547a57795ae8cb79d577a4) (lhnizdo) | GPL-3.0 ou ultérieure | | Adaptation de la vérification des formats inscriptibles pour les vues UAV de texture |
 | [JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd) (JoshuuDev) | GPL-3.0 | Verrou de remappage par plage ; corrections de blend et de descripteurs | |
 | zm0kie | GPL-3.0 | Overlay (F10), envois de fenêtres, lignes mémoire, `tools/` (`start-neptune.ps1`, `memwatch.ps1`) | |
-| [skornuta/victory-fork](https://github.com/skornuta/victory-fork) (skornuta) | GPL-3.0 | Export des temps d'image (`VICTORY_FRAMETIME_DUMP`) | |
+| [skornuta/victory-fork](https://github.com/skornuta/victory-fork) (skornuta) | GPL-3.0 | Export des temps d'image (`VICTORY_FRAMETIME_DUMP`) | Renouvellement des allocateurs et élagage des blocs scratch (`VICTORY_ALLOCATOR_TRIM`) ; budgets indirects regroupés (`VICTORY_BUDGET_PACK`) ; comparaison par morceaux (`VICTORY_COMPARE_PIECES`, `75d1f4f`) ; éviction des slots (`6497c6e`, `406ff5f`) ; suivi des lectures bindless (`7c274de`, `9c0c61b`, `876456c`, `79dc3be`) ; detiling sur GPU et redimensionnement des buffers (`d8a3df8`, `0ab9ab8`, `390d949`, `2f94a58`) |
 | Trexies | GPL-3.0 | Petits tampons regroupés | |
 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory/commit/94c1ead4ed8499f2ae3c05d4d5f99b28164cc2cf) (Flare) | GPL-3.0 ou ultérieure | | Filtrage mip par point des samplers anisotropes dans les tas de descripteurs |
 | Le correctif de redirection FidelityFX reçu pour DexNom Runtime | GPL-3.0 | `VICTORY_FSR_DLL` (mode Series S, non utilisé par le lanceur) | |

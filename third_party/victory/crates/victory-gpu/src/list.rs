@@ -277,7 +277,7 @@ pub(crate) fn ran(lists: &mut [Detached]) {
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -311,20 +311,44 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+#[cfg(windows)]
+fn idle_trim_seconds() -> Option<u64> {
+    static SECONDS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        crate::host::allocator_trim_seconds().map(|fallback| {
+            std::env::var("VICTORY_LIST_POOL_IDLE_S")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|&seconds| seconds > 0)
+                .unwrap_or(fallback)
+        })
+    })
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
+    let (idle, expired) = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut expired = Vec::new();
+        if let Some(seconds) = idle_trim_seconds() {
+            let now = crate::host::now_ms();
+            while idle.0.first().is_some_and(|item| idle_expired(item.2, now, seconds)) {
+                let item = idle.0.remove(0);
+                idle.1 -= item.1;
+                expired.push(item);
+            }
+        }
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
-        taken
+        (taken, expired)
     };
+    drop(expired);
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -337,6 +361,19 @@ fn fresh_list() -> Option<crate::host::HostList> {
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
+    }
+    // Even a full pool must discard expired entries before its capacity
+    // check, otherwise a burst can keep the oldest lists indefinitely.
+    if let Some(seconds) = idle_trim_seconds() {
+        let now = crate::host::now_ms();
+        let gone = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            let count = stale_count(idle.0.iter().map(|item| item.2), now, seconds.saturating_mul(1000));
+            let gone: Vec<_> = idle.0.drain(..count).collect();
+            idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+            gone
+        };
+        drop(gone);
     }
     for (i, Detached { host, _uploads, state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
@@ -351,10 +388,46 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            let now = crate::host::now_ms();
+            idle.0.push(Idle(host, bytes, now));
             idle.1 += bytes;
+            if let Some(seconds) = idle_trim_seconds() {
+                let count = stale_count(idle.0.iter().map(|item| item.2), now, seconds.saturating_mul(1000));
+                let gone: Vec<_> = idle.0.drain(..count).collect();
+                idle.1 -= gone.iter().map(|item| item.1).sum::<u64>();
+                drop(idle);
+                drop(gone);
+            }
         }
     }
+}
+
+#[cfg(windows)]
+fn idle_expired(added: u64, now: u64, seconds: u64) -> bool {
+    now.saturating_sub(added) > seconds.saturating_mul(1000)
+}
+
+#[cfg(windows)]
+fn stale_count(pushed: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usize {
+    pushed.take_while(|&at| now.saturating_sub(at) > max_age).count()
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn idle_list_age_saturates_and_respects_the_limit() {
+    assert!(!idle_expired(100, 99, 30));
+    assert!(!idle_expired(100, 30_099, 30));
+    assert!(!idle_expired(100, 30_100, 30));
+    assert!(idle_expired(100, 30_101, 30));
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn only_the_oldest_idle_lists_are_stale() {
+    assert_eq!(stale_count([10, 20, 900, 950].into_iter(), 1000, 100), 2);
+    assert_eq!(stale_count([950].into_iter(), 1000, 100), 0);
+    assert_eq!(stale_count(std::iter::empty(), 1000, 100), 0);
+    assert_eq!(stale_count([2000].into_iter(), 1000, 100), 0);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut

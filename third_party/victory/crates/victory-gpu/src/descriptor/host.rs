@@ -1013,6 +1013,20 @@ const COPIED_GRACE: u64 = 4;
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
+pub(crate) fn seen_since(stamp: u32, cutoff: u64, frame: u64) -> bool {
+    let stamp = stamp & !TABLED_READ;
+    if stamp == 0 {
+        return false;
+    }
+    let mask = !TABLED_READ;
+    let now = (frame as u32).wrapping_add(1) & mask;
+    let cut = (cutoff as u32).wrapping_add(1) & mask;
+    // Ages back from now, in the stamps' 31 bits.
+    let age = now.wrapping_sub(stamp) & mask;
+    let limit = now.wrapping_sub(cut) & mask;
+    age < limit
+}
+
 /// Since the start: writes of texture views into slots that count as a
 /// table's (due later), and slots that left the queue because a draw read
 /// them through a table.
@@ -1072,6 +1086,10 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// (Neptune) Slots whose texture the slot eviction let go while no shader read them
+    /// (`crate::feedback`): never due by themselves, made again only when a shader is seen
+    /// reading one ([`TextureQueue::unpark`]) or the title writes another view into it.
+    parked: std::collections::BTreeMap<u32, u64>,
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
@@ -1170,6 +1188,10 @@ impl TextureQueue {
     /// the host slot from a view the queue may hold already, which then
     /// stays as it is.
     fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
+        // (Neptune) The title wrote a view into a parked slot: its own, wanted now.
+        if !seen {
+            self.parked.remove(&index);
+        }
         if seen && self.slots.contains_key(&index) {
             return;
         }
@@ -1224,7 +1246,7 @@ impl TextureQueue {
             } else if w.looks > 0 {
                 counts[2] += 1;
             }
-            if w.due <= frame {
+            if w.due <= frame && !self.parked.contains_key(&index) {
                 counts[1] += 1;
                 counts[4] = counts[4].max(frame.saturating_sub(w.written));
                 if collect_slots {
@@ -1347,6 +1369,25 @@ impl TextureQueue {
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
     /// not take it out).
+    /// (Neptune) Slot `index` lost its texture to the slot eviction while it showed the view of
+    /// key `key`: parked with it.
+    fn park(&mut self, index: u32, key: u64) {
+        self.parked.insert(index, key);
+        if let Some(w) = self.slots.get_mut(&index) {
+            w.checked = (0, 0, 0, 0, 0);
+        }
+    }
+
+    /// (Neptune) A shader read parked slot `index` (seen in `frame`): no longer parked, and due
+    /// now as one written now, so the queue makes its texture again. Whether it was parked.
+    fn unpark(&mut self, index: u32, frame: u64) -> bool {
+        if self.parked.remove(&index).is_none() {
+            return false;
+        }
+        self.changed(index, frame, frame);
+        true
+    }
+
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
         let write = self.next_revision();
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
@@ -1726,6 +1767,9 @@ pub(crate) fn probe_view_limit() {
             raw_twins = twins,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
+        // (Neptune) Bindless usage feedback (`crate::feedback`): told the translator with the
+        // limit, before the first shader, as every translation keeps it.
+        victory_shader::emit::set_bindless_feedback(crate::feedback::on());
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
 }
@@ -1921,6 +1965,25 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // (Neptune) Bindless usage feedback: the slot below the null slot holds the feedback
+        // buffer (`crate::feedback`), out of the dynamic slots if it is one of them, written
+        // after the heap was made null.
+        if !sampler
+            && let Some(slot) = victory_shader::emit::feedback_slot()
+            && slot < size
+        {
+            if let Some(d) = slot.checked_sub(h.count).filter(|&d| d < h.dynamic) {
+                let mut next = h.next.lock().unwrap_or_else(|e| e.into_inner());
+                if !next.1[d as usize] {
+                    next.1[d as usize] = true;
+                    h.free.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if !crate::feedback::install(h.cpu(slot), slot) {
+                tracing::warn!(slot, "VICTORY_BINDLESS_FEEDBACK=1: no feedback buffer in this view heap");
+                return None;
+            }
+        }
         Some(h)
     }
 
@@ -2472,6 +2535,40 @@ impl HostHeap {
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
+    /// (Neptune) Parks title slot `index` ([`TextureQueue::park`]): its texture was let go
+    /// while no shader read it.
+    pub(crate) fn park(&self, index: u32, key: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).park(index, key);
+    }
+
+    /// (Neptune) Parks title slot `index` with the view the title's record at `handle` holds (the
+    /// key [`HostHeap::mirror`] makes of it), and takes it out of the queue's due slots: the queue
+    /// came to a slot of a texture the eviction let go unread. Whether it was a view.
+    pub(crate) fn park_at(&self, index: u32, handle: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || generation == 0 {
+            return false;
+        }
+        self.park(index, u64::from(generation) << 32 | u64::from(i));
+        true
+    }
+
+    /// (Neptune) The key of the view host slot `index` shows now (0: none).
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made.get(index).unwrap_or(0)
+    }
+
+    /// (Neptune) Of `seen` (slots a shader read, `crate::feedback`), the parked ones are due
+    /// again ([`TextureQueue::unpark`]). Returns how many.
+    pub(crate) fn unpark_seen(&self, seen: &[u32], frame: u64) -> u64 {
+        let mut queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.parked.is_empty() {
+            return 0;
+        }
+        seen.iter().filter(|&&i| queue.unpark(i, frame)).count() as u64
+    }
+
     ///
     /// Not at the first look: a title that moves a texture in its streaming
     /// memory unmaps it before it maps it again, and what was shown went
@@ -2506,6 +2603,54 @@ impl HostHeap {
         }
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    ///
+    /// (Neptune) With bindless usage feedback (`fb_cutoff`: the frame its idle time back, when
+    /// the feedback has watched every frame since, `crate::feedback::covers`), a title slot no
+    /// table showed lately is safe too when no shader read it after that frame: it is parked
+    /// when its texture goes (the last field says which), and made again when a shader reads it.
+    pub(crate) fn slots_showing(
+        &self,
+        raws: &std::collections::HashSet<usize>,
+        frame: u64,
+        cutoff: u64,
+        fb_cutoff: Option<u64>,
+    ) -> Vec<(u32, usize, bool, bool, bool)> {
+        self.kept
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                // (A lock to a slot: see `kept`.)
+                let raw = {
+                    let r = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    windows::core::Interface::as_raw(r.as_ref()?) as usize
+                };
+                raws.contains(&raw).then(|| {
+                    let i = i as u32;
+                    let title = i < self.count && !self.sampler;
+                    let tabled = self.tabled_lately(i, frame);
+                    let lately = seen_since(self.tabled_stamp(i), cutoff, frame);
+                    let bindless = title
+                        && !tabled
+                        && !lately
+                        && fb_cutoff.is_some_and(|c| !crate::feedback::seen_since(i, c));
+                    (i, raw, (title && tabled) || bindless, lately, bindless)
+                })
+            })
+            .collect()
+    }
+
+    // Unlike a temporarily unmapped texture, an eviction must null the slot immediately.
+    pub(super) fn evict_texture_slot(&self, index: u32, resource: usize) -> bool {
+        let _locked = self.made.lock(index);
+        let Some(key) = self.made.get(index).filter(|&key| key != 0) else { return false };
+        if !matches!(view_at(key as u32, (key >> 32) as u32),
+            Some(View::Shader(r, _) | View::Unordered(r, _, _)) if r == resource) {
+            return false;
+        }
+        self.unmake(index);
         true
     }
 
@@ -3698,6 +3843,19 @@ impl HostHeap {
             }
             return None;
         };
+        // (Neptune) A slot parked with this very view (`crate::feedback`): the title writing it
+        // again (its records are copied about every frame) leaves it parked and null; a draw
+        // reading it through a table wants it now, and unparks it. A slot parked with another
+        // view is the title's new one: made as any other (the queue unparks it).
+        if shown != key && !self.sampler && crate::feedback::on() {
+            let mut queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if queue.parked.get(&index) == Some(&key) {
+                if !for_draw {
+                    return Some(view);
+                }
+                queue.parked.remove(&index);
+            }
+        }
         if shown != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
@@ -5546,6 +5704,27 @@ mod alpha_view_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (Neptune) A parked slot is never served, whatever puts it in the queue (the sweep, a
+    /// change of its memory); a shader seen reading it makes it due at once; the title writing
+    /// another view into it unparks it too; a slot not parked is not touched by an unpark.
+    #[test]
+    fn a_parked_slot_waits_until_a_shader_reads_it() {
+        let mut q = TextureQueue::default();
+        q.park(9, 0x1_0000_0007);
+        q.written(9, 10, 10, true); // the sweep puts it back in the queue
+        q.changed(9, 11, 11); // its memory changed
+        assert!(q.due(1_000, 99).is_empty(), "parked: not served");
+        assert!(!q.unpark(5, 12), "not parked");
+        assert!(q.unpark(9, 20), "a shader read it");
+        let due = q.due(20, 99);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, 9);
+        assert!(!q.unpark(9, 21), "once");
+        q.park(4, 0x1_0000_0004);
+        q.written(4, 30, 30, false); // the title wrote a view into it
+        assert!(q.due(30, 99).iter().any(|&(i, _)| i == 4), "unparked by the write");
+    }
 
     #[test]
     fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
