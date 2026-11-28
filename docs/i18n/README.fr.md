@@ -83,7 +83,7 @@ Le graphique est régénéré par `scarlett.py --traduction <dossier du paquet> 
 | Audio XMA2 de la console décodé en WAV par le portage Rust de FFmpeg par TomBox (LGPL) | 🟡 en cours |
 | Exceptions SEH x64 (`.pdata`), chargement dynamique d'une DLL à l'exécution (`LoadLibrary` + `DllMain`) | ⏳ à faire |
 | Graphismes D3D12.X vers Direct3D 12 / Vulkan | ⏳ à faire |
-| 1900+ tests automatisés | ✅ fait |
+| 2000+ tests automatisés | ✅ fait |
 | Vérifications des pull requests : lint et synchronisation des README anglais et français (lignes, images, nombre de tests) | ✅ fait |
 
 ## Recherche et historique

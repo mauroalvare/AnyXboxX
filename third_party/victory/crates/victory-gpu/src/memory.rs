@@ -1317,8 +1317,8 @@ impl Memory {
     /// (owned arenas and the directory mark their own dirty ranges directly).
     fn bring_up(&self, list: &HostList) {
         list.keep(&self.directory.1.buffer);
-        for &n in &self.arenas {
-            list.keep(&self.copies[n].buffer);
+        for arena in &self.arenas {
+            list.keep(&self.copies[arena.copy].buffer);
         }
         for &n in &self.title_copies {
             let shadow = &self.copies[n];
