@@ -25,7 +25,11 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
 ] }
 
 [dev-dependencies]

@@ -49,6 +49,60 @@ pub const TUNED: &[(&str, &str)] = &[
     ("VICTORY_INDIRECT_BATCH", "2"),
 ];
 
+/// Logical CPUs from which the three worker pools below replace the 8-core `TUNED` sizes.
+pub const BIG_CPU_THRESHOLD: usize = 16;
+
+/// The larger pools, for CPUs with at least [`BIG_CPU_THRESHOLD`] logical CPUs: Vice-Tay's own 16-core values
+/// (for its RTX 4090 machine). `TUNED` stays the 8-core set (Ryzen 7800X3D).
+///
+/// Measured 2026-11-27, RTX 4070 SUPER + i7-13700KF (24 logical CPUs), Series X, 1080p, warm cache, same build,
+/// one run each: 8/6/4 gave a world median of 19.6 fps (10th percentile 5.7); 12/8/6 gave 23.8 fps (10th
+/// percentile 11.9). The landing pool sat full at x3.5-3.7 of 4 threads before, x4.4-5.2 of 6 after.
+const BIG_POOLS: &[(&str, &str)] = &[
+    ("VICTORY_THIN_THREADS", "12"),
+    ("VICTORY_UNDER_THREADS", "8"),
+    ("VICTORY_LAND_THREADS", "6"),
+];
+
+/// From this many logical CPUs, the landing pool gets 8 threads ([`HUGE_POOLS`]).
+pub const HUGE_CPU_THRESHOLD: usize = 24;
+
+/// [`BIG_POOLS`] with 8 landing threads, for CPUs with at least [`HUGE_CPU_THRESHOLD`] logical CPUs.
+///
+/// Measured 2026-11-27, RTX 4070 SUPER + i7-13700KF (24 logical CPUs), Series X, 1080p, warm cache, same build,
+/// one long run each, by draws a frame: 5,000-7,000 draws 17.1 -> 22.0 fps, over 7,000 draws 14.6 -> 17.8 fps,
+/// 10th percentile 10.4 -> 16.1 fps, lighter scenes unchanged (23-25 fps). With 6 threads the landing pool sat at
+/// x5.2-5.4 in heavy scenes; with 8 it reaches x6.1-6.6.
+const HUGE_POOLS: &[(&str, &str)] = &[
+    ("VICTORY_THIN_THREADS", "12"),
+    ("VICTORY_UNDER_THREADS", "8"),
+    ("VICTORY_LAND_THREADS", "8"),
+];
+
+/// The worker-pool sizes to apply over `TUNED` for a CPU with `logical_cpus` logical CPUs, or `None` to keep the
+/// 8-core sizes.
+pub fn pool_sizes(logical_cpus: usize) -> Option<&'static [(&'static str, &'static str)]> {
+    if logical_cpus >= HUGE_CPU_THRESHOLD {
+        Some(HUGE_POOLS)
+    } else {
+        (logical_cpus >= BIG_CPU_THRESHOLD).then_some(BIG_POOLS)
+    }
+}
+
+/// Overrides the detected logical CPU count (a positive integer): lets tests and benchmarks pin the pool sizes.
+pub const LOGICAL_CPUS_VAR: &str = "ANYXBOXX_LOGICAL_CPUS";
+
+/// Logical CPUs of this machine (`std::thread::available_parallelism`, 1 when unknown), or the positive integer
+/// in `ANYXBOXX_LOGICAL_CPUS`.
+pub fn logical_cpus() -> usize {
+    std::env::var(LOGICAL_CPUS_VAR)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1)
+}
+
 /// Linux (Proton) + AMD measured set (PR #199, RX 9070 XT / RADV / vkd3d-proton).
 /// Kept in sync with `crates/anyxboxx-launcher/profiles.toml` (`linux-amd`).
 pub const LINUX_AMD: &[(&str, &str)] = &[
@@ -91,22 +145,27 @@ fn pairs(
         .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
 }
 
-/// Variables set before the XG library is checked, in the script's order.
+/// Profile settings and switches. Explicit overrides are applied after XG validation.
 pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
+    base_with_cpus(args, logical_cpus())
+}
+
+/// [`base`] for a machine with `logical_cpus` logical CPUs.
+pub fn base_with_cpus(args: &RunArgs, logical_cpus: usize) -> Vec<(String, OsString)> {
     let mut env = vec![(GAME_DIR.to_string(), args.game_dir.clone().into_os_string())];
     env.extend(pairs(ALWAYS));
     if !args.no_tuned_settings {
         match args.profile {
-            Profile::WindowsNvidia => env.extend(pairs(TUNED)),
+            Profile::WindowsNvidia => {
+                env.extend(pairs(TUNED));
+                env.extend(pairs(pool_sizes(logical_cpus).unwrap_or(&[])));
+            }
             Profile::LinuxAmd => env.extend(pairs(LINUX_AMD)),
             Profile::Defaults => {}
         }
     }
     if args.quality {
         env.extend(pairs(QUALITY));
-    }
-    for (name, value) in &args.overrides {
-        env.push((name.clone(), OsString::from(value)));
     }
     if args.auto_a {
         env.push((AUTO_A.to_string(), OsString::from("150")));

@@ -8,10 +8,19 @@ use crate::wave::Wave;
 pub const HALF_NAN: u32 = 0x7E00;
 pub const HALF_INFINITY: u32 = 0x7C00;
 pub const HALF_ONE: u32 = 0x3C00;
+pub const ALMOST_ONE_HALF: u32 = 0x3BFF;
 pub const HALF_MASK: u32 = 0xFFFF;
 pub const HALF_SIGN: u32 = 0x8000;
 /// `FLOAT_NAN` of the model: the f32 NaN given to a NaN half converted to single precision.
 pub const FLOAT_NAN: u32 = 0x7FC0_0000;
+
+/// Source operand kind of scalar f16, f16 compare and f16 conversion instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Half,
+    Word,
+    Int16,
+}
 
 /// Inline float constants 240 to 248 read by a half-precision source (`INLINE_HALVES`).
 const INLINE_HALVES: [(u32, u32); 9] = [
@@ -129,11 +138,107 @@ pub fn half_clamp(bits: u32) -> u32 {
 }
 
 /// The inline half of a source code (240 to 248), if it is one.
-fn inline_half(code: u32) -> Option<u32> {
+pub fn inline_half(code: u32) -> Option<u32> {
     INLINE_HALVES
         .iter()
         .find(|(inline, _)| *inline == code)
         .map(|(_, bits)| *bits)
+}
+
+/// `half_toward_zero`: binary16 bits of `value` rounded toward zero; finite values past ±65504 give ±65504.
+pub fn half_toward_zero(value: f64) -> u32 {
+    if value.is_nan() || value.is_infinite() {
+        return half_from_f64(value);
+    }
+    let bits = half_from_f64(value);
+    if half_to_f64(bits).abs() > value.abs() {
+        bits - 1
+    } else {
+        bits
+    }
+}
+
+/// `half_round`: IEEE roundToIntegral in binary16 keeping the sign (`trunc(-0.5) = -0`), ±inf unchanged, NaN -> `0x7E00`.
+pub fn half_round(bits: u32, rounding: fn(f64) -> f64) -> u32 {
+    if is_nan(bits) {
+        return HALF_NAN;
+    }
+    if bits & 0x7FFF == HALF_INFINITY {
+        return bits;
+    }
+    let value = half_to_f64(bits);
+    half_from_f64(rounding(value).copysign(value))
+}
+
+/// `half_fract`: `S0 - floor(S0)` clamped at `0x3BFF`; ±infinity and NaN give `0x7E00`.
+pub fn half_fract(bits: u32) -> u32 {
+    if is_nan(bits) || bits & 0x7FFF == HALF_INFINITY {
+        return HALF_NAN;
+    }
+    let value = half_to_f64(bits);
+    let frac = value - value.floor().copysign(value);
+    half_from_f64(frac.min(half_to_f64(ALMOST_ONE_HALF)))
+}
+
+/// `half_frexp`: `(mantissa_f16, exponent)` of `S0 = m * 2^e` with `0.5 <= |m| < 1`; ±0, ±inf and NaN give `(bits, 0)`.
+pub fn half_frexp(bits: u32) -> (u32, i32) {
+    if bits & 0x7FFF == 0 || bits & 0x7FFF >= HALF_INFINITY {
+        return (bits, 0);
+    }
+    let (mantissa, exponent) = crate::float::frexp(half_to_f64(bits));
+    (half_from_f64(mantissa), exponent)
+}
+
+/// `_source` of `emu/rdna2_exec_f16.py`: reads a 32-bit word (`Word`) or a 16-bit half (`Half` / `Int16`).
+pub fn read_source(
+    wave: &Wave,
+    name: &str,
+    kind: SourceKind,
+    code: u32,
+    lane: usize,
+    literal: Option<u32>,
+    high: bool,
+) -> Result<u32, Error> {
+    if kind == SourceKind::Word {
+        return wave.read_lane(code, lane, literal);
+    }
+    if !(128..crate::wave::VGPR_FIRST).contains(&code) {
+        let word = wave.read_lane(code, lane, literal)?;
+        return Ok(if high { word >> 16 } else { word & HALF_MASK });
+    }
+    if high {
+        return Err(Error::Untranslated(format!(
+            "{name}: op_sel on the high half of a constant not supported"
+        )));
+    }
+    if let Some(bits) = inline_half(code) {
+        if kind == SourceKind::Int16 {
+            return Err(Error::Untranslated(format!(
+                "{name}: float inline constant on an integer source not supported"
+            )));
+        }
+        return Ok(bits);
+    }
+    Ok((wave.read_scalar(code, literal, 1)? as u32) & HALF_MASK)
+}
+
+/// `_modified` of `emu/rdna2_exec_f16.py`: VOP3 `abs` and `neg` on bit 15 (`Half`) or bit 31 (`Word`).
+pub fn modify_source(mut value: u32, kind: SourceKind, abs: u32, neg: u32, index: usize) -> u32 {
+    if kind == SourceKind::Int16 {
+        return value;
+    }
+    let sign = if kind == SourceKind::Word {
+        0x8000_0000
+    } else {
+        HALF_SIGN
+    };
+    if (abs >> index) & 1 != 0 {
+        value &= !sign;
+    }
+    if (neg >> index) & 1 != 0 {
+        value ^= sign;
+    }
+    value
 }
 
 /// `_read_pk_half`: one 16-bit half of a source. Inline constants repeat in both halves; a register or

@@ -10,7 +10,8 @@
 //!
 //! The title's nodes are in title memory, named by address: they are read
 //! through the host's copies of title memory ([`Lower::memory`]), one look
-//! in its directory per node (two for a 128-byte box node).
+//! in its directory per node (and a second look only when a 128-byte box
+//! node has children 2 or 3 and straddles a 64 KiB page boundary).
 //!
 //! Shape of the code, under the instruction's lane guard:
 //!
@@ -25,7 +26,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, Term, V, Why, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -59,6 +60,13 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// How box-child sorting is controlled for a BVH node test.
+#[derive(Clone, Copy)]
+enum BoxSort {
+    Static(bool),
+    Dynamic(V),
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -76,8 +84,8 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
-        if *a16 || *d16 || *tfe || *lwe || *dmask != 0xf {
-            return Err("a ray-tracing node test with 16-bit operands or a partial result");
+        if *a16 || *d16 || *tfe || *lwe || *dmask == 0 || *dmask > 0xf {
+            return Err("a ray-tracing node test with 16-bit operands or an empty result");
         }
         let wide = inst.name() == "image_bvh64_intersect_ray";
         // Operand VGPRs in order: the node pointer (two dwords in the
@@ -104,19 +112,18 @@ impl<'a> Lower<'a> {
             .find(|n| n.0 == site)
             .map(|n| n.1)
             .ok_or("an untracked ray-tracing structure")?;
-        let (sort, barycentrics) = match nodes {
-            BvhNodes::Resource => (true, true),
-            BvhNodes::Memory { word1, word3 } => (
-                word1 & bvh::BOX_SORT != 0,
-                word3 & bvh::RETURN_BARYCENTRICS != 0,
-            ),
+        let (static_sort, barycentrics) = match nodes {
+            BvhNodes::Resource => (Some(true), true),
+            BvhNodes::Memory { box_sort, word3 } => {
+                (box_sort, word3 & bvh::RETURN_BARYCENTRICS != 0)
+            }
         };
         if !barycentrics {
             // Mode 0 returns a triangle id and a hit status in the last two
             // dwords; no program of the title asks for it.
             return Err("a ray-tracing structure that returns triangle ids");
         }
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -134,21 +141,8 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
-        let c = self.cur;
-        let at = match nodes {
-            BvhNodes::Resource => {
-                let src = self
-                    .descriptors
-                    .get(&(site, false))
-                    .copied()
-                    .ok_or("an untracked ray-tracing structure")?;
-                let handle = self.handle(site, src, false, (11, 0))?;
-                // (pointer >> 3) << 6 from the buffer's start.
-                let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
-                let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
-                let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
-                NodeAt::Buffer { handle, byte }
-            }
+        let mem_words = match nodes {
+            BvhNodes::Resource => None,
             BvhNodes::Memory { .. } => {
                 let Operand::Scalar { code, .. } = *rsrc else {
                     return Err("a ray-tracing structure descriptor not in SGPRs");
@@ -160,11 +154,61 @@ impl<'a> Lower<'a> {
                         .ok_or("an unread operand")?;
                     *w = self.i32_of(v)?;
                 }
+                Some(words)
+            }
+        };
+        let buf_handle = match nodes {
+            BvhNodes::Resource => {
+                let src = self
+                    .descriptors
+                    .get(&(site, false))
+                    .copied()
+                    .ok_or("an untracked ray-tracing structure")?;
+                Some(self.handle(site, src, false, (11, 0))?)
+            }
+            BvhNodes::Memory { .. } => None,
+        };
+        let sort = match (static_sort, mem_words) {
+            (Some(s), _) => BoxSort::Static(s),
+            (None, Some(words)) => {
+                let c = self.cur;
+                let bit = self.s.m.i32(bvh::BOX_SORT);
+                let masked = self.s.m.bin(c, Bin::And, words[1], bit);
+                let z = self.s.m.i32(0);
+                BoxSort::Dynamic(self.s.m.cmp(c, pred::NE, masked, z))
+            }
+            (None, None) => unreachable!(),
+        };
+        let zero = self.s.m.i32(0);
+        let gate = self.begin_guarded(guard);
+        let head = self.cur;
+        let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
+        let kind = self.s.m.bin(head, Bin::And, pointer, k7);
+        // Kinds 6 (instance) and 7 (procedural / bvh::NONE = 0xffff_ffff) do
+        // not read node memory; skip the directory lookup and fault check so
+        // unread or sentinel pointers never read SLOT_MEMORY or write to
+        // SLOT_FAULTS.
+        let reads_node = self.s.m.cmp(head, pred::IULT, kind, k6);
+        let (read_block, box_block) = (self.s.m.new_block(), self.s.m.new_block());
+        let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s
+            .m
+            .terminate(head, Term::CondBr(reads_node, read_block, join));
+        self.cur = read_block;
+        let at = match (buf_handle, mem_words) {
+            (Some(handle), None) => {
+                // (pointer >> 3) << 6 from the buffer's start.
+                let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
+                let byte = self.s.m.bin(read_block, Bin::And, pointer, kind_bits);
+                let byte = self.s.m.bin(read_block, Bin::Shl, byte, k3);
+                NodeAt::Buffer { handle, byte }
+            }
+            (None, Some(words)) => {
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
-                // One look for the node's copy, before the branches: a
-                // node is 64 bytes on 64, so its first half lies in one
-                // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                // One look for the node's copy, inside the lane guard and only
+                // for kinds 0-5: a node is 64 bytes on 64, so its first half
+                // lies in one 64 KiB page whatever its kind.
+                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -173,23 +217,14 @@ impl<'a> Lower<'a> {
                     mapped,
                 }
             }
+            _ => unreachable!(),
         };
-        let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
-        let head = self.cur;
-        let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
-        let kind = self.s.m.bin(head, Bin::And, pointer, k7);
-        let pair = self.s.m.bin(head, Bin::And, pointer, k6);
-        let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
-        let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
-        let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
-        let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
+        let read_end = self.cur;
+        // Since kind < 6 here, kinds 4-5 are boxes and 0-3 are triangles.
+        let is_box = self.s.m.cmp(read_end, pred::IUGE, kind, k4);
         self.s
             .m
-            .terminate(head, Term::CondBr(is_box, box_block, leaf_block));
-        self.s
-            .m
-            .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
+            .terminate(read_end, Term::CondBr(is_box, box_block, triangle_block));
         self.cur = box_block;
         let boxes = self.bvh_boxes(at, kind, &ray, sort);
         let box_end = self.cur;
@@ -211,14 +246,19 @@ impl<'a> Lower<'a> {
                 vec![
                     (boxes[k], box_end),
                     (triangle[k], triangle_end),
-                    (other[k], leaf_block),
+                    (other[k], head),
                 ],
             );
             results.push((phi, zero));
         }
         let results = self.end_guarded(gate, &results);
+        // Partial masks assume ordinary MIMG packing into consecutive VGPRs.
+        let mut out_reg = 0u8;
         for (k, &r) in results.iter().enumerate() {
-            self.write(inst, Reg::V(dst + k as u8), r, guard);
+            if (*dmask >> k) & 1 != 0 {
+                self.write(inst, Reg::V(dst + out_reg), r, guard);
+                out_reg += 1;
+            }
         }
         Ok(())
     }
@@ -312,29 +352,52 @@ impl<'a> Lower<'a> {
 
     /// The node's title address, [`bvh::node_address`]: the descriptor's
     /// base (dword 0 and the low byte of dword 1, in 256-byte units) plus
-    /// `(pointer >> 3) << 6`.
+    /// `(pointer >> 3) << 6`, computed in 32-bit halves so shaders that do
+    /// not otherwise use 64-bit integers stay free of `flags::INT64`.
     fn bvh_address(&mut self, word0: V, word1: V, pointer: V, pointer_high: Option<V>) -> (V, V) {
         let c = self.cur;
-        let i64t = self.s.m.int(64);
-        let (zero, byte) = (self.s.m.i32(0), self.s.m.i32(0xff));
-        let base_high = self.s.m.bin(c, Bin::And, word1, byte);
-        let base = self.join64(word0, base_high);
-        let k8 = self.s.m.int_const(i64t, 8);
-        let base = self.s.m.bin(c, Bin::Shl, base, k8);
-        let p = self.join64(pointer, pointer_high.unwrap_or(zero));
-        let (k3, k6) = (self.s.m.int_const(i64t, 3), self.s.m.int_const(i64t, 6));
-        let p = self.s.m.bin(c, Bin::LShr, p, k3);
-        let p = self.s.m.bin(c, Bin::Shl, p, k6);
-        let a = self.s.m.bin(c, Bin::Add, base, p);
-        self.s.flags |= flags::INT64;
-        self.split64(a)
+        let i32t = self.s.t.i32;
+        let (k3, k8, k24, k29) = (
+            self.s.m.i32(3),
+            self.s.m.i32(8),
+            self.s.m.i32(24),
+            self.s.m.i32(29),
+        );
+        let (byte, kind_mask) = (self.s.m.i32(0xff), self.s.m.i32(!7));
+        // base = ((word1 & 0xff) << 32 | word0) << 8
+        let base_lo = self.s.m.bin(c, Bin::Shl, word0, k8);
+        let base_hi_top = self.s.m.bin(c, Bin::And, word1, byte);
+        let base_hi_top = self.s.m.bin(c, Bin::Shl, base_hi_top, k8);
+        let base_hi_bot = self.s.m.bin(c, Bin::LShr, word0, k24);
+        let base_hi = self.s.m.bin(c, Bin::Or, base_hi_top, base_hi_bot);
+        // p = (pointer >> 3) << 6 = (pointer & !7) << 3
+        let p_masked = self.s.m.bin(c, Bin::And, pointer, kind_mask);
+        let p_lo = self.s.m.bin(c, Bin::Shl, p_masked, k3);
+        let p_hi_bot = self.s.m.bin(c, Bin::LShr, pointer, k29);
+        let p_hi = match pointer_high {
+            Some(hi) => {
+                let top = self.s.m.bin(c, Bin::Shl, hi, k3);
+                self.s.m.bin(c, Bin::Or, top, p_hi_bot)
+            }
+            None => p_hi_bot,
+        };
+        let low = self.s.m.bin(c, Bin::Add, base_lo, p_lo);
+        let wrapped = self.s.m.cmp(c, pred::IULT, low, base_lo);
+        let carry = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let high = self.s.m.bin(c, Bin::Add, base_hi, p_hi);
+        let high = self.s.m.bin(c, Bin::Add, high, carry);
+        (low, high)
     }
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
     /// current block and leaves `self.cur` at the block it ends in.
-    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
+    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: BoxSort) -> [V; 4] {
         let head = self.cur;
+        // Load the entire first 64 bytes (4 children + 12 box dwords) before
+        // branching on 32-bit vs 16-bit bounds so mixed warps never read bytes
+        // 16..64 twice.
         let children = self.bvh_node_words(at, None, 0, 4);
+        let first_words = self.bvh_node_words(at, None, 16, 12);
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -342,24 +405,113 @@ impl<'a> Lower<'a> {
         self.s
             .m
             .terminate(head, Term::CondBr(wide, wide_block, half_block));
-        // 32-bit floats: 24 dwords from byte 16.
+        // 32-bit floats: bytes 16..64 are boxes 0-1 (already loaded); bytes
+        // 64..112 are boxes 2-3, only needed when child 2 or child 3 is
+        // present, and stay on the same 64 KiB page (reusing the same heap
+        // handle at byte + 64) unless `(low & 0xFFFF) == 0xFFC0`.
         self.cur = wide_block;
-        let k16 = self.s.m.i32(16);
-        let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
-        let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        // (The look for the second half goes on in another block.)
-        let wide_block = self.cur;
-        self.s.m.terminate(wide_block, Term::Br(join));
-        // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
-        // of a dword first.
-        self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let none = self.s.m.i32(bvh::NONE);
+        let fzero = self.s.m.f32(0);
         let f32t = self.s.t.f32;
+        let first_floats: Vec<V> = first_words.iter().map(|&w| self.as_float(w)).collect();
+        // Since NONE == 0xffff_ffff, both children 2 and 3 are absent iff
+        // (children[2] & children[3]) == NONE.
+        let both_hi = self.s.m.bin(wide_block, Bin::And, children[2], children[3]);
+        let has_hi = self.s.m.cmp(wide_block, pred::NE, both_hi, none);
+        let wide_join = self.s.m.new_block();
+        let (second_floats, wide_mapped): (Vec<V>, Option<V>) = match at {
+            NodeAt::Buffer { .. } => {
+                let load_hi = self.s.m.new_block();
+                self.s
+                    .m
+                    .terminate(wide_block, Term::CondBr(has_hi, load_hi, wide_join));
+                self.cur = load_hi;
+                let words2 = self.bvh_node_words(at, None, 64, 12);
+                let floats2: Vec<V> = words2.iter().map(|&w| self.as_float(w)).collect();
+                self.s.m.terminate(load_hi, Term::Br(wide_join));
+                self.cur = wide_join;
+                let phis = (0..12)
+                    .map(|n| {
+                        let phi = self.s.m.phi(wide_join, f32t);
+                        self.s
+                            .m
+                            .set_phi(phi, vec![(floats2[n], load_hi), (fzero, wide_block)]);
+                        phi
+                    })
+                    .collect();
+                (phis, None)
+            }
+            NodeAt::Memory {
+                low,
+                mapped: first,
+                ..
+            } => {
+                let check_page = self.s.m.new_block();
+                let (same_block, cross_block) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s
+                    .m
+                    .terminate(wide_block, Term::CondBr(has_hi, check_page, wide_join));
+                self.cur = check_page;
+                let (mask, edge) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFC0));
+                let within = self.s.m.bin(check_page, Bin::And, low, mask);
+                let crosses = self.s.m.cmp(check_page, pred::EQ, within, edge);
+                self.s
+                    .m
+                    .terminate(check_page, Term::CondBr(crosses, cross_block, same_block));
+                // Fast path (99.9% of 64B-aligned nodes, 100% of 128B-aligned):
+                // same page and same heap handle at +64 bytes.
+                self.cur = same_block;
+                let same_words = self.bvh_node_words(at, None, 64, 12);
+                let same_floats: Vec<V> = same_words.iter().map(|&w| self.as_float(w)).collect();
+                self.s.m.terminate(same_block, Term::Br(wide_join));
+                // Slow path: node straddles a 64 KiB page boundary.
+                self.cur = cross_block;
+                let second = self.bvh_second_half(at);
+                let cross_words = self.bvh_node_words(second, None, 0, 12);
+                let cross_floats: Vec<V> = cross_words.iter().map(|&w| self.as_float(w)).collect();
+                let NodeAt::Memory { mapped: last, .. } = second else {
+                    unreachable!()
+                };
+                let cross_end = self.cur;
+                self.s.m.terminate(cross_end, Term::Br(wide_join));
+                self.cur = wide_join;
+                let phis = (0..12)
+                    .map(|n| {
+                        let phi = self.s.m.phi(wide_join, f32t);
+                        self.s.m.set_phi(
+                            phi,
+                            vec![
+                                (same_floats[n], same_block),
+                                (cross_floats[n], cross_end),
+                                (fzero, wide_block),
+                            ],
+                        );
+                        phi
+                    })
+                    .collect();
+                let i1t = self.s.m.type_of(first);
+                let mapped = self.s.m.phi(wide_join, i1t);
+                self.s.m.set_phi(
+                    mapped,
+                    vec![
+                        (first, same_block),
+                        (last, cross_end),
+                        (first, wide_block),
+                    ],
+                );
+                (phis, Some(mapped))
+            }
+        };
+        let mut floats = first_floats;
+        floats.extend(second_floats);
+        self.s.m.terminate(wide_join, Term::Br(join));
+        // 16-bit floats: 24 halves in the 12 dwords already loaded from byte 16,
+        // the low half of a dword first.
+        self.cur = half_block;
+        let k16 = self.s.m.i32(16);
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
-            let mut h = words[n / 2];
+            let mut h = first_words[n / 2];
             if n % 2 == 1 {
                 h = self.s.m.bin(half_block, Bin::LShr, h, k16);
             }
@@ -378,13 +530,13 @@ impl<'a> Lower<'a> {
         // A page that is not there reads zeros, which are a child and a box:
         // no child of it is hit. (The last two boxes of a 128-byte node are in
         // its second half.)
-        let there = match (at, second) {
-            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
+        let there = match (at, wide_mapped) {
+            (NodeAt::Memory { mapped: first, .. }, Some(last)) => {
                 let i1t = self.s.m.type_of(first);
                 let mapped = self.s.m.phi(join, i1t);
                 self.s
                     .m
-                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
+                    .set_phi(mapped, vec![(last, wide_join), (first, half_block)]);
                 let both = self.s.m.bin(join, Bin::And, first, mapped);
                 Some([first, first, both, both])
             }
@@ -395,7 +547,7 @@ impl<'a> Lower<'a> {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_join), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
@@ -448,9 +600,14 @@ impl<'a> Lower<'a> {
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
-        if sort {
+        if !matches!(sort, BoxSort::Static(false)) {
             for (a, b) in [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)] {
-                let swap = self.s.m.cmp(c, pred::OLT, distances[b], distances[a]);
+                let closer = self.s.m.cmp(c, pred::OLT, distances[b], distances[a]);
+                let swap = match sort {
+                    BoxSort::Static(true) => closer,
+                    BoxSort::Dynamic(enabled) => self.s.m.bin(c, Bin::And, closer, enabled),
+                    BoxSort::Static(false) => unreachable!(),
+                };
                 let (da, db) = (distances[a], distances[b]);
                 distances[a] = self.s.m.select(c, swap, db, da);
                 distances[b] = self.s.m.select(c, swap, da, db);

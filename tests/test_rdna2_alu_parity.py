@@ -7,6 +7,7 @@ import pytest
 
 from emu import rdna2_exec, rdna2_exec_ops, rdna2_exec_vop3, rdna2_gpu, rdna2_hlsl
 from emu.rdna2_exec_ops import bits_float, float_bits
+from emu.rdna2_hlsl_helpers import HELPERS
 from test_rdna2_exec import OPCODES, V, const, program, sop1, sop2, sopc, vop1, vop2, vop3
 from test_rdna2_exec_memory import INPUT, global_
 from test_rdna2_hlsl import compare, store_lane, with_lane_offset
@@ -268,3 +269,11 @@ def test_v_rndne_f32_ties_to_even_and_specials_on_gpu():
     assert "uint RndneF32(" in rdna2_hlsl.translate(code)
     expected, actual = compare(code, memory=bytes(memory))
     assert actual == expected
+
+
+def test_rndne_helper_has_a_single_return():
+    """An early return in RndneF32 makes the AMD driver for the RX 9070 XT (32.0.32029.2010) miscompile
+    a neighbouring v_bfrev_b32 (bit 30 set, #160, #260): the cases are computed and chosen at the end."""
+    start = HELPERS.index("uint RndneF32(")
+    body = HELPERS[start:HELPERS.index("\n}", start)]
+    assert body.count("return") == 1

@@ -29,7 +29,7 @@ Au choix :
 - **Précompilé** : téléchargez `anyxboxx-launcher.exe` depuis les [releases du lanceur](https://github.com/LooperSalty/AnyXboxX/releases?q=launcher&expanded=true), comparez son SHA-256 à `anyxboxx-launcher.exe.sha256` (`Get-FileHash .\anyxboxx-launcher.exe`), puis placez-le **dans le dossier `AnyXboxX`** cloné (ou un de ses sous-dossiers).
 - **Depuis les sources** : `cargo build --release -p anyxboxx-launcher`, puis `target\release\anyxboxx-launcher.exe`.
 
-Le lanceur trouve le dépôt en remontant depuis son propre dossier jusqu'à `third_party\victory\Cargo.toml`. S'il est rangé ailleurs, définissez `ANYXBOXX_REPO` sur le dossier cloné (`setx ANYXBOXX_REPO C:\chemin\vers\AnyXboxX`, puis ouvrez une nouvelle fenêtre). Sans l'un ou l'autre, JOUER s'arrête sur « repository not found ».
+Le lanceur a besoin de votre clone AnyXboxX (le dossier qui contient `third_party\victory\Cargo.toml`). Il regarde, dans cet ordre : le dossier choisi dans **Setup → AnyXboxX folder** (enregistré dans `settings.toml` ; un dossier sans `third_party\victory\Cargo.toml` est refusé avec une explication), `ANYXBOXX_REPO`, son propre dossier et chaque parent (ainsi que le dossier courant), puis quelques emplacements usuels : le dossier parent du lanceur et ses voisins nommés `AnyXboxX*`, `%USERPROFILE%\AnyXboxX`, `Documents\AnyXboxX`, `source\repos\AnyXboxX`, `Desktop\AnyXboxX` et `Downloads\AnyXboxX*`. La page Setup montre le dossier utilisé et d'où il vient. Si l'exécutable est hors du clone (par exemple dans Téléchargements), rangez-le dans le clone ou choisissez une fois le dossier du clone dans Setup. Sans clone, JOUER ouvre Setup et affiche « AnyXboxX folder not found ».
 
 ### 3. Premier démarrage
 
@@ -42,6 +42,8 @@ Le lanceur trouve le dépôt en remontant depuis son propre dossier jusqu'à `th
 Le premier lancement après un nouveau build ou un nouveau réglage recompile des centaines de pipelines et tourne bien en dessous de 1 fps pendant un moment : jugez la vitesse au deuxième lancement, cache rempli.
 
 ## Options
+
+Dans **Play → NVIDIA DLSS**, choisissez le dossier Streamline, activez Super Resolution et réglez son mode de qualité. La génération d’images 2x a son propre interrupteur et nécessite une GeForce RTX série 40 ou 50 avec la planification de processeur graphique à accélération matérielle activée. Les deux options sont désactivées par défaut. [Fichiers NVIDIA, installation et mesure de débit](dlss.md).
 
 - Résolution et mode de fenêtre (fenêtré ou sans bordure).
 - Disposition du clavier : automatique, QWERTY, AZERTY ou QWERTZ (`VICTORY_KEYBOARD`).
@@ -65,10 +67,11 @@ Les réglages sont des profils par système et par fabricant de carte (`crates/a
 
 ## Dépannage
 
-- **« repository not found »** : l'exécutable est hors du dépôt cloné et `ANYXBOXX_REPO` n'est pas défini (étape 2).
+- **« AnyXboxX folder not found »** : l'exécutable est hors du clone et aucun emplacement usuel n'en contient un. Ouvrez Setup → AnyXboxX folder, cliquez sur Browse et choisissez votre clone (clonez d'abord https://github.com/LooperSalty/AnyXboxX si vous n'en avez pas). Le choix est mémorisé. `ANYXBOXX_REPO` fonctionne aussi.
 - **La compilation de VIctory échoue** : lancez `cargo build --release -p victory --manifest-path third_party\victory\Cargo.toml` dans un terminal pour lire le message de cargo ; il manque le plus souvent la charge MSVC.
 - **Un jeu tourne déjà** : le lanceur n'autorise qu'un jeu à la fois, car deux partageraient le dossier des sauvegardes.
 - **La fenêtre s'est fermée seule** : le journal indique `window closed: suspending the title` quand c'est vous qui l'avez fermée ; un plantage est écrit dans `crashes.log` sous `%LOCALAPPDATA%\victory\data\`.
 - **Erreur Windows 1455 dans `crashes.log`** : le fichier d'échange est trop petit ; fermez d'autres applications ou agrandissez-le.
+- **Le lanceur n'ouvre jamais sa fenêtre** (le processus reste dans le Gestionnaire des tâches) : sous Windows, sa fenêtre est dessinée avec Direct3D 12. Pour essayer une autre API graphique, lancez-le depuis une invite de commandes après `set WGPU_BACKEND=vulkan` (ou `dx12`, la valeur par défaut) ; voir l'issue #483.
 
 Sous Proton ou Wine, le lanceur ne peut pas compiler VIctory (pas de cargo) : utilisez `anyxboxx run` comme décrit dans [lancer-gta6.md](lancer-gta6.md).

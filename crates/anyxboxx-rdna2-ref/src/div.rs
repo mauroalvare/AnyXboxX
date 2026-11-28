@@ -422,6 +422,7 @@ pub fn execute(
         } else {
             div_fixup(s0, s1, s2, fmt)
         };
+        wave.vgpr_group(destination, if fmt.width == 64 { 2 } else { 1 })?;
         wave.v[destination][lane] = (result & 0xFFFF_FFFF) as u32;
         if fmt.width == 64 {
             wave.v[destination + 1][lane] = (result >> 32) as u32;

@@ -16,7 +16,7 @@ const MASK64: u64 = u64::MAX;
 /// The comparison of two values, in the model's order: `lt`, `eq`, `le`, `gt`, `lg`, `ge`, and the
 /// unordered and negated forms. Integer compares only use `f`, `lt`, `eq`, `le`, `gt`, `ne`, `ge`, `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Test {
+pub(crate) enum Test {
     False,
     True,
     Lt,
@@ -36,7 +36,7 @@ enum Test {
     NotLt,
 }
 
-fn test_of(name: &str) -> Option<Test> {
+pub(crate) fn test_of(name: &str) -> Option<Test> {
     Some(match name {
         "f" => Test::False,
         "tru" | "t" => Test::True,
@@ -61,7 +61,7 @@ fn test_of(name: &str) -> Option<Test> {
 
 /// The float tests of `FLOAT_TESTS` (the Python on doubles; NaN makes every ordered test false).
 #[allow(clippy::neg_cmp_op_on_partial_ord, clippy::nonminimal_bool)] // negated forms are the IEEE unordered tests on purpose
-fn float_test(test: Test, x: f64, y: f64) -> bool {
+pub(crate) fn float_test(test: Test, x: f64, y: f64) -> bool {
     match test {
         Test::False => false,
         Test::True => true,
@@ -99,7 +99,7 @@ fn integer_test(test: Test, x: i128, y: i128) -> bool {
 }
 
 /// The float tests (`FLOAT_TESTS`) and the integer tests (`INTEGER_TESTS`) by name.
-const FLOAT_NAMES: [&str; 16] = [
+pub(crate) const FLOAT_NAMES: [&str; 16] = [
     "f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt",
     "tru",
 ];
@@ -137,8 +137,12 @@ pub fn is_compare(name: &str) -> bool {
 }
 
 /// IEEE class bit index of a float (0 to 9), as `float_class` of the model.
-fn float_class(bits: u64, width: u32) -> u32 {
-    let (exponent_bits, mantissa_bits) = if width == 32 { (8, 23) } else { (11, 52) };
+pub(crate) fn float_class(bits: u64, width: u32) -> u32 {
+    let (exponent_bits, mantissa_bits) = match width {
+        16 => (5, 10),
+        32 => (8, 23),
+        _ => (11, 52),
+    };
     let negative = (bits >> (width - 1)) & 1 == 1;
     let exponent = (bits >> mantissa_bits) & ((1 << exponent_bits) - 1);
     let mantissa = bits & ((1 << mantissa_bits) - 1);

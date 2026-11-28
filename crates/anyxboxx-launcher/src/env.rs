@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyxboxx::run::{Env, RunArgs, XgMode, environment};
+use anyxboxx::run::{Env, RunArgs, XgMode, environment, logical_cpus, pool_sizes};
 
 use crate::profile::Profile;
 
@@ -70,6 +70,21 @@ pub fn build_env(
     overrides: &[Pair],
     xg: Option<&Xg>,
 ) -> Result<Env, EnvError> {
+    build_env_with_cpus(game_dir, profile, overrides, xg, logical_cpus())
+}
+
+/// The id of the profile whose set is `anyxboxx::run::TUNED` (the one the bigger pools apply to).
+const TUNED_PROFILE_ID: &str = "windows-nvidia";
+
+/// [`build_env`] for a machine with `logical_cpus` logical CPUs: on the tuned profile, 16 or more of them
+/// replace the 8-core worker-pool sizes (after the profile, before the user's overrides).
+pub fn build_env_with_cpus(
+    game_dir: &Path,
+    profile: &Profile,
+    overrides: &[Pair],
+    xg: Option<&Xg>,
+    logical_cpus: usize,
+) -> Result<Env, EnvError> {
     let base = environment(&RunArgs {
         game_dir: game_dir.to_path_buf(),
         skip_pipelines: None,
@@ -87,12 +102,20 @@ pub fn build_env(
         xg_dll: xg.map(|x| x.dll.clone()),
         xg_mode: xg.map_or(XgMode::Real, |x| x.mode),
         batch_card_rehash: false,
+        // The console only changes the `victory run` command line, not the environment.
+        console: anyxboxx::run::Console::SeriesX,
         victory_exe: None,
         repo: None,
     })?;
     let profile_pairs = profile.env.iter().map(|(k, v)| (k.clone(), v.clone()));
+    let pools = (profile.id == TUNED_PROFILE_ID)
+        .then(|| pool_sizes(logical_cpus))
+        .flatten()
+        .unwrap_or(&[])
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()));
     let overrides = overrides.iter().cloned();
-    Ok(merge(base, profile_pairs.chain(overrides)))
+    Ok(merge(base, profile_pairs.chain(pools).chain(overrides)))
 }
 
 /// Applies `(key, value)` pairs over `base`: a repeated key replaces the value in place.
@@ -207,7 +230,8 @@ mod tests {
     #[test]
     fn windows_nvidia_env_sets_the_tuned_settings_exactly() {
         let dir = game_folder();
-        let env = build_env(dir.path(), &profile("windows-nvidia"), &[], None).expect("env");
+        let env = build_env_with_cpus(dir.path(), &profile("windows-nvidia"), &[], None, 8)
+            .expect("env");
         for (key, expected) in TUNED {
             assert_eq!(value(&env, key).as_deref(), Some(*expected), "{key}");
         }
@@ -220,6 +244,46 @@ mod tests {
             Some("light"),
             "DRED=light is part of the tuned set"
         );
+    }
+
+    fn pools(env: &Env) -> Vec<Option<String>> {
+        [
+            "VICTORY_THIN_THREADS",
+            "VICTORY_UNDER_THREADS",
+            "VICTORY_LAND_THREADS",
+        ]
+        .iter()
+        .map(|k| value(env, k))
+        .collect()
+    }
+
+    fn some(values: [&str; 3]) -> Vec<Option<String>> {
+        values.iter().map(|v| Some((*v).to_string())).collect()
+    }
+
+    #[test]
+    fn windows_nvidia_env_takes_the_big_pools_from_16_logical_cpus() {
+        let dir = game_folder();
+        let nvidia = profile("windows-nvidia");
+        let small = build_env_with_cpus(dir.path(), &nvidia, &[], None, 15).expect("env");
+        assert_eq!(pools(&small), some(["8", "6", "4"]));
+        let big = build_env_with_cpus(dir.path(), &nvidia, &[], None, 16).expect("env");
+        assert_eq!(pools(&big), some(["12", "8", "6"]));
+        let huge = build_env_with_cpus(dir.path(), &nvidia, &[], None, 24).expect("env");
+        assert_eq!(pools(&huge), some(["12", "8", "8"]));
+        assert_eq!(value(&big, "VICTORY_MAP_THREADS").as_deref(), Some("1"));
+        // The user's options still win over the bigger pools.
+        let overrides = parse_overrides("VICTORY_LAND_THREADS=5").expect("valid");
+        let user = build_env_with_cpus(dir.path(), &nvidia, &overrides, None, 24).expect("env");
+        assert_eq!(pools(&user), some(["12", "8", "5"]));
+    }
+
+    #[test]
+    fn other_profiles_ignore_the_cpu_count() {
+        let dir = game_folder();
+        let linux = profile("linux-amd");
+        let env = build_env_with_cpus(dir.path(), &linux, &[], None, 32).expect("env");
+        assert_eq!(pools(&env), vec![None, None, None]);
     }
 
     #[test]

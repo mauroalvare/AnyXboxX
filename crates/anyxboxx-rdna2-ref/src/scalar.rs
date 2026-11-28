@@ -69,6 +69,37 @@ fn binary(
     Ok(())
 }
 
+/// S0 of the signed 64-bit instructions (`s_ashr_i64`, `s_bfe_i64`, `s_flbit_i32_i64`): the Python
+/// `signed_literal_s0`. A 32-bit literal there is sign-extended, not zero-extended.
+///
+/// AMD "RDNA 2" ISA (November 2020), section 6.2.1, "Literal Expansion to 64 bits" (p. 43): "64-bit
+/// unsigned integer: zero extended to 64 bits; 64-bit signed integer: sign extended to 64 bits". The
+/// unsigned and bitwise 64-bit sources (`s_bfe_u64`, `s_*_b64`) keep zero-extending.
+fn read_signed64_s0(wave: &Wave, f: &Fields, literal: Option<u32>) -> Result<u64, Error> {
+    let value = wave.read_scalar(f.ssrc0, literal, 2)?;
+    Ok(if f.ssrc0 == crate::decode::LITERAL {
+        sign_extend(value, 32) as u64
+    } else {
+        value
+    })
+}
+
+/// `binary` for the instructions whose S0 is a signed 64-bit integer and whose S1 is 32 bits: a 64-bit
+/// result, SCC from the operation.
+fn binary_signed64(
+    wave: &mut Wave,
+    f: &Fields,
+    literal: Option<u32>,
+    operation: impl Fn(u64, u64) -> (u64, bool),
+) -> Result<(), Error> {
+    let a = read_signed64_s0(wave, f, literal)?;
+    let b = wave.read_scalar(f.ssrc1, literal, 1)?;
+    let (result, scc) = operation(a, b);
+    wave.write_scalar(f.sdst, result, 2)?;
+    wave.scc = scc;
+    Ok(())
+}
+
 /// The Python `_sop1`: a result of `None` is not written.
 fn unary(
     wave: &mut Wave,
@@ -330,17 +361,17 @@ fn sop2(wave: &mut Wave, name: &str, f: &Fields, lit: Option<u32>) -> Result<boo
             let result = bfe(a, b, 64, false);
             (result as u64, Some(result != 0))
         })?,
-        "s_bfe_i64" => binary(wave, f, lit, (2, 2, 1), |a, b, _| {
+        "s_bfe_i64" => binary_signed64(wave, f, lit, |a, b| {
             let result = bfe(a, b, 64, true);
-            (result as u64, Some(result != 0))
+            (result as u64, result != 0)
         })?,
         "s_bfm_b64" => binary(wave, f, lit, (2, 1, 1), |a, b, _| {
             let mask = ((1u128 << (a & 63)) - 1) << (b & 63);
             (mask as u64, None)
         })?,
-        "s_ashr_i64" => binary(wave, f, lit, (2, 2, 1), |a, b, _| {
+        "s_ashr_i64" => binary_signed64(wave, f, lit, |a, b| {
             let result = sign_extend(a, 64) >> (b & 63);
-            (result as u64, Some(result != 0))
+            (result as u64, result != 0)
         })?,
         "s_absdiff_i32" => binary(wave, f, lit, (1, 1, 1), |a, b, _| {
             let result = sign_extend(a.wrapping_sub(b), 32).unsigned_abs() & MASK32;
@@ -449,7 +480,10 @@ fn sop1(wave: &mut Wave, name: &str, f: &Fields, lit: Option<u32>) -> Result<boo
         "s_ff0_i32_b64" => wide_source(wave, f, lit, |a| first_one(!a & MASK64) & MASK32, false)?,
         "s_ff1_i32_b64" => wide_source(wave, f, lit, |a| first_one(a) & MASK32, false)?,
         "s_flbit_i32_b64" => wide_source(wave, f, lit, |a| leading_zeros(a, 64) & MASK32, false)?,
-        "s_flbit_i32_i64" => wide_source(wave, f, lit, |a| leading_signs(a, 64) & MASK32, false)?,
+        "s_flbit_i32_i64" => {
+            let result = leading_signs(read_signed64_s0(wave, f, lit)?, 64) & MASK32;
+            wave.write_scalar(f.sdst, result, 1)?;
+        }
         "s_bitreplicate_b64_b32" => {
             let a = wave.read_scalar(f.ssrc0, lit, 1)?;
             wave.write_scalar(f.sdst, bitreplicate(a), 2)?;
@@ -690,6 +724,50 @@ mod tests {
         assert_eq!(bfe(0xABCD_1234, 4 | (8 << 16), 32, false), 0x23);
         assert_eq!(bfe(0x80, 4 | (4 << 16), 32, true), -8);
         assert_eq!(bfe(0x80, 0, 32, false), 0);
+    }
+
+    /// Runs `name` with the literal as S0.
+    fn with_literal(wave: &mut Wave, name: &str, sdst: u32, ssrc1: u32, literal: u32) {
+        let f = Fields {
+            sdst,
+            ssrc0: crate::decode::LITERAL,
+            ssrc1,
+            simm16: 0,
+        };
+        assert!(execute(wave, name, &f, Some(literal)).unwrap());
+    }
+
+    #[test]
+    fn a_literal_is_sign_extended_for_a_signed_64_bit_source_only() {
+        // ISA section 6.2.1 (p. 43); the cases of tests/test_rdna2_exec_bits.py.
+        let mut wave = Wave::new(32).unwrap();
+        // s_ashr_i64 by the inline constant 1 (code 129), then by 4 (code 132) on a positive literal.
+        with_literal(&mut wave, "s_ashr_i64", 40, 129, 0x8000_0000);
+        assert_eq!((wave.s[41], wave.s[40]), (0xFFFF_FFFF, 0xC000_0000));
+        assert!(wave.scc);
+        with_literal(&mut wave, "s_ashr_i64", 42, 132, 0x7FFF_FFFF);
+        assert_eq!((wave.s[43], wave.s[42]), (0, 0x07FF_FFFF));
+        // Offset 4, width 40 in s60: the signed extract sees the extended sign, the unsigned one zeros.
+        wave.s[60] = 40 << 16 | 4;
+        with_literal(&mut wave, "s_bfe_i64", 44, 60, 0x8000_0000);
+        assert_eq!((wave.s[45], wave.s[44]), (0xFFFF_FFFF, 0xF800_0000));
+        with_literal(&mut wave, "s_bfe_u64", 46, 60, 0x8000_0000);
+        assert_eq!((wave.s[47], wave.s[46]), (0, 0x0800_0000));
+        // Bit 3 is the first one that differs from the sign; read as bits, 32 leading zeros.
+        with_literal(&mut wave, "s_flbit_i32_i64", 51, 0, 0xFFFF_FFF0);
+        assert_eq!(wave.s[51], 60);
+        with_literal(&mut wave, "s_flbit_i32_b64", 52, 0, 0xFFFF_FFF0);
+        assert_eq!(wave.s[52], 32);
+        // A register pair is read as it is: no extension of its low half.
+        wave.s[0] = 0x8000_0000;
+        let pair = Fields {
+            sdst: 54,
+            ssrc0: 0,
+            ssrc1: 129,
+            simm16: 0,
+        };
+        assert!(execute(&mut wave, "s_ashr_i64", &pair, None).unwrap());
+        assert_eq!((wave.s[55], wave.s[54]), (0, 0x4000_0000));
     }
 
     #[test]

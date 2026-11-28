@@ -91,7 +91,7 @@ fn refusal(name: &str, fields: &Fields) -> Option<String> {
 /// S2 of `words` 32-bit words: four VGPRs, or a 64-bit source (register pair or inline constant).
 fn wide_source(wave: &Wave, code: u32, lane: usize, words: usize) -> Result<u128, Error> {
     if code >= VGPR_FIRST {
-        let base = (code - VGPR_FIRST) as usize;
+        let base = wave.vgpr_group((code - VGPR_FIRST) as usize, words)?;
         let mut value = 0u128;
         for i in 0..words {
             value |= u128::from(wave.v[base + i][lane]) << (32 * i);
@@ -127,9 +127,9 @@ pub fn execute(
         let s0 = read64(wave, src0, lane, false)?;
         let s2 = wide_source(wave, src2, lane, words)?;
         let result = quad(name, s0, b, s2).unwrap_or(0);
+        let destination = wave.vgpr_group(fields.vdst as usize, words)?;
         for i in 0..words {
-            wave.v[fields.vdst as usize + i][lane] =
-                ((result >> (32 * i)) & u128::from(MASK32)) as u32;
+            wave.v[destination + i][lane] = ((result >> (32 * i)) & u128::from(MASK32)) as u32;
         }
     }
     Ok(true)

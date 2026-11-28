@@ -20,11 +20,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use anyhow::Context;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+};
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
@@ -218,16 +222,16 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     at
 }
 
-/// Calls `f` with each pipeline's number and entry; where the last whole one
-/// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
+/// Calls `f` with the offset of each length prefix and the entry that follows.
+/// Returns where the last whole entry ends.
+fn walk_pipelines(dir: &Path, mut f: impl FnMut(u64, &[u8])) -> u64 {
     let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
-    let (mut at, mut n) = (0, 0);
+    let mut at = 0;
     while let Some(head) = bytes.get(at..at + 4) {
         let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+        f(at as u64, entry);
+        at += 4 + size;
     }
     at as u64
 }
@@ -239,24 +243,82 @@ pub fn count(dir: &Path) -> usize {
     n
 }
 
+fn recipe_key(entry: &[u8]) -> String {
+    entry.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
-    });
+    walk_pipelines(dir, |_, entry| all.push(recipe_key(entry)));
     all
 }
 
-/// What a driver's cached pipelines depend on besides the title's: the
-/// translator with its settings, and the driver.
-pub fn fingerprint() -> String {
-    let mut h = blake3::Hasher::new();
-    h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
-        h.update(&host.driver().to_le_bytes());
+/// A recorded pipeline and whether the configured shader skip list excludes it.
+pub struct WarmEntry {
+    pub key: String,
+    pub skipped: bool,
+    pub offset: u64,
+}
+
+/// Entries in their recorded order, so worker indices still name the same pipelines.
+pub fn warm_entries(dir: &Path) -> Vec<WarmEntry> {
+    let skips = super::skip_hashes();
+    let mut entries = Vec::new();
+    walk_pipelines(dir, |offset, entry| {
+        entries.push(WarmEntry { key: recipe_key(entry), skipped: matches_skip_list(entry, skips), offset });
+    });
+    entries
+}
+
+fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
+    if skips.is_empty() {
+        return false;
     }
-    h.finalize().to_hex()[..16].to_owned()
+    let Some((&count, rest)) = entry.get(16..).and_then(|bytes| bytes.split_first()) else {
+        return false;
+    };
+    let Some(shaders) = rest.get(..usize::from(count) * 33) else {
+        return false;
+    };
+    shaders.chunks_exact(33).any(|shader| {
+        let hash = blake3::Hash::from_bytes(shader[1..].try_into().expect("recorded shader hash"));
+        let hex = hash.to_hex();
+        skips.iter().any(|skip| skip == &hex[..16])
+    })
+}
+
+/// Compiler context for a warm attempt on the selected D3D12 device.
+#[derive(Clone, Copy)]
+pub struct WarmCacheMetadata {
+    pub translation: [u8; 32],
+    pub software: bool,
+    /// Vendor, device, subsystem and revision. These persist across boots.
+    pub adapter: [u32; 4],
+    pub driver: i64,
+}
+
+/// Read the selected adapter rather than inferring the backend from a switch.
+/// A journal cannot establish a match when the host or driver is unknown.
+pub fn warm_cache_metadata() -> anyhow::Result<WarmCacheMetadata> {
+    let host = crate::host::host().context("D3D12 warm device unavailable")?;
+    let driver = host.driver();
+    anyhow::ensure!(driver != 0, "DXGI driver version unavailable for the warm adapter");
+    // SAFETY: query the adapter description by its live device's LUID.
+    let desc = unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            .context("creating the DXGI factory for warm adapter metadata")?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid())
+            .context("finding the selected warm adapter in DXGI")?;
+        adapter.GetDesc1().context("reading the selected warm adapter description")?
+    };
+    Ok(WarmCacheMetadata {
+        // Host creation establishes the adapter's wave settings first.
+        translation: crate::shader_cache::translation(),
+        software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        adapter: [desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision],
+        driver,
+    })
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
@@ -265,23 +327,51 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
-/// Makes the host pipelines of those of `which` (numbers in the file) and
-/// lets each go again: the driver's cache on disk keeps them. `each` is told
-/// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// A recipe selected by the warm command, in the book it scanned.
+pub struct WarmRecipe<'a> {
+    pub index: usize,
+    pub offset: u64,
+    pub key: &'a str,
+}
+
+/// Load only this worker's recipes, in request order. Check the keys before
+/// any work is reported so a changed book is a setup error, not a bad shader.
+fn requested_pipelines(dir: &Path, which: &[WarmRecipe<'_>]) -> io::Result<Vec<Vec<u8>>> {
+    let mut book = std::fs::File::open(dir.join(PIPELINES))?;
+    let len = book.metadata()?.len();
+    which.iter().map(|recipe| {
+        let Some(body) = recipe.offset.checked_add(4).filter(|&at| at <= len) else {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipeline recipe offset past end of book"));
+        };
+        book.seek(SeekFrom::Start(recipe.offset))?;
+        let mut head = [0; 4];
+        book.read_exact(&mut head)?;
+        let size = u32::from_le_bytes(head);
+        if u64::from(size) > len - body {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete pipeline recipe"));
+        }
+        let mut entry = vec![0; size as usize];
+        book.read_exact(&mut entry)?;
+        if recipe_key(&entry) != recipe.key {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pipeline book changed before the worker read it"));
+        }
+        Ok(entry)
+    }).collect()
+}
+
+/// Makes the selected host pipelines and lets each go again: the driver's
+/// cache on disk keeps them. `each` receives each recipe's index before
+/// compiling, and afterward with elapsed milliseconds and success. Unreadable
+/// recipes return an error before reporting the start of compilation.
+pub fn make(
+    dir: &Path, which: &[WarmRecipe<'_>], mut each: impl FnMut(usize, Option<(f64, bool)>),
+) -> io::Result<()> {
+    let entries = requested_pipelines(dir, which)?;
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| {
         places.insert(hash, (stage, at, len));
     });
-    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
-    let wanted: HashSet<usize> = which.iter().copied().collect();
-    let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
-        if wanted.contains(&n) {
-            entries.insert(n, bytes.to_vec());
-        }
-    });
+    let mut file = std::fs::File::open(dir.join(SHADERS))?;
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
@@ -289,15 +379,19 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         file.read_exact(&mut bytes).ok()?;
         Some(bytes)
     };
-    for n in which {
-        let Some(entry) = entries.get(n) else { continue };
-        each(*n, None);
+    for (recipe, entry) in which.iter().zip(&entries) {
         let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
-        each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        let (shaders, graphics) = parse(entry, &mut read).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pipeline recipe {} ({}) or its shader data is incomplete or invalid", recipe.index, recipe.key),
+            )
+        })?;
+        each(recipe.index, None);
+        let made = HostPipeline::new(&shaders, graphics.as_deref()).is_some();
+        each(recipe.index, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]
@@ -548,6 +642,66 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn a_warm_skip_can_match_any_shader_in_a_recipe() {
+        let mut entry = vec![0xff; 16];
+        entry.extend([2, 0]);
+        entry.extend([0x11; 32]);
+        entry.push(1);
+        entry.extend([0x22; 32]);
+        entry.push(0);
+
+        let skips = vec!["22".repeat(8)];
+        assert!(matches_skip_list(&entry, &skips));
+        assert!(!matches_skip_list(&entry, &["33".repeat(8)]));
+        assert!(!matches_skip_list(&entry, &[]));
+        assert!(!matches_skip_list(&entry[..entry.len() - 2], &skips));
+    }
+
+    #[test]
+    fn a_warm_worker_reads_selected_recipes_in_request_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for (byte, size) in [(1, 18u32), (2, 240), (3, 51)] {
+            bytes.extend(size.to_le_bytes());
+            bytes.extend(vec![byte; size as usize]);
+        }
+        bytes.extend(100u32.to_le_bytes()); // interrupted append
+        std::fs::write(dir.path().join(PIPELINES), &bytes).unwrap();
+        let entries = warm_entries(dir.path());
+        assert_eq!(entries.len(), 3);
+        let request = |index: usize| WarmRecipe {
+            index, offset: entries[index].offset, key: &entries[index].key,
+        };
+        let which = [request(2), request(0), request(2)];
+        assert_eq!(requested_pipelines(dir.path(), &which).unwrap(), [vec![3; 51], vec![1; 18], vec![3; 51]]);
+
+        let mut stale = [request(0)];
+        stale[0].offset = entries[1].offset;
+        assert_eq!(requested_pipelines(dir.path(), &stale).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        stale[0].offset = (bytes.len() - 4) as u64;
+        assert_eq!(requested_pipelines(dir.path(), &stale).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_missing_shader_keeps_the_pipeline_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = vec![0x12; 16];
+        entry.extend([1, 5]); // One compute shader.
+        entry.extend([0xab; 32]);
+        entry.push(0); // No graphics state.
+        let mut book = (entry.len() as u32).to_le_bytes().to_vec();
+        book.extend(entry);
+        std::fs::write(dir.path().join(PIPELINES), book).unwrap();
+        std::fs::write(dir.path().join(SHADERS), b"").unwrap();
+
+        let key = "12".repeat(16);
+        let which = [WarmRecipe { index: 0, offset: 0, key: &key }];
+        let error = make(dir.path(), &which, |_, _| panic!("an unreadable recipe reported progress")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&key));
     }
 
     #[test]

@@ -64,7 +64,7 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
 
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
-fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
+pub(crate) fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

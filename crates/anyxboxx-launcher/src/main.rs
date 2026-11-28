@@ -21,8 +21,10 @@ mod bar;
 mod cache;
 mod cover;
 mod detached;
+mod dlss;
 mod env;
 mod format;
+mod framegen;
 mod home;
 mod host;
 mod job;
@@ -36,22 +38,27 @@ mod picker;
 mod processes;
 mod profile;
 mod progress;
+mod renderer;
+mod repo_dir;
 mod session;
 mod setup;
 mod shade;
 mod smooth_motion;
 mod splash;
 mod store;
+mod streamline;
 mod theme;
 mod toast;
 mod tokens;
 mod ui;
 mod ui_chrome;
+mod ui_dlss;
 mod ui_home;
 mod ui_launch;
 mod ui_manifest;
 mod ui_options;
 mod ui_pages;
+mod ui_repo;
 mod ui_play;
 mod ui_states;
 mod verify;
@@ -66,6 +73,7 @@ fn main() -> eframe::Result {
             .with_title("AnyXboxX launcher")
             .with_inner_size([1180.0, 780.0])
             .with_min_inner_size([860.0, 560.0]),
+        wgpu_options: renderer::wgpu_options(host::detect_host()),
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(

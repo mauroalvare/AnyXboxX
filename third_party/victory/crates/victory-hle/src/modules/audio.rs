@@ -68,6 +68,9 @@ const APU_BASE: u32 = 0x0001_0000;
 impl Heap {
     /// First fit in the free ranges.
     fn take(&mut self, size: u32, align: u32) -> Option<u32> {
+        if size == 0 || align == 0 {
+            return None;
+        }
         if self.free.is_empty() && !self.created {
             self.free.insert(APU_BASE, u32::MAX);
         }
@@ -87,6 +90,9 @@ impl Heap {
     }
 
     fn give_back(&mut self, mut start: u32, mut end: u32) {
+        if start >= end {
+            return;
+        }
         if let Some((&before, &before_end)) = self.free.range(..start).next_back()
             && before_end == start
         {
@@ -103,17 +109,28 @@ impl Heap {
 /// Zeroed host memory and its device address.
 fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
-    let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    let apu_size = u32::try_from(layout.size()).ok()?;
+    let apu_align = u32::try_from(layout.align()).ok()?;
+    // Allocate and zero outside `HEAP` so large audio buffers do not stall
+    // concurrent audio-thread address lookups.
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
-        heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
-    heap.blocks
-        .insert(ptr as usize, Block { size, apu, layout });
-    heap.by_apu.insert(apu, ptr as usize);
+    let apu = {
+        let mut heap = lock(&HEAP);
+        let Some(apu) = heap.take(apu_size, apu_align) else {
+            drop(heap);
+            // SAFETY: allocated above with `layout`.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+            return None;
+        };
+        heap.blocks
+            .insert(ptr as usize, Block { size, apu, layout });
+        heap.by_apu.insert(apu, ptr as usize);
+        apu
+    };
     // The big ones are named in the log: they are the title's audio memory
     // given out of our allocator, which the memory line counts as ours.
     if size >= 32 << 20 {
@@ -1426,5 +1443,84 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn apu_heap_coalesces_checkerboard_and_mixed_alignment_stress() {
+        let mut heap = Heap {
+            blocks: BTreeMap::new(),
+            by_apu: BTreeMap::new(),
+            free: BTreeMap::new(),
+            created: false,
+        };
+        assert_eq!(heap.take(0, 16), None);
+        assert_eq!(heap.take(64, 0), None);
+
+        let aligns = [16u32, 64, 256, 4096, 65536];
+        let mut live: Vec<(u32, u32)> = Vec::with_capacity(256);
+        for i in 0..256u32 {
+            let align = aligns[(i as usize) % aligns.len()];
+            let size = ((i % 7) + 1) * 1024 + 32;
+            let apu = heap.take(size, align).expect("first-fit alloc");
+            assert_eq!(apu % align, 0, "device address must satisfy alignment");
+            assert!(apu >= APU_BASE);
+            live.push((apu, apu + size));
+        }
+
+        // Verify no two live allocations overlap.
+        let mut sorted = live.clone();
+        sorted.sort_unstable();
+        for w in sorted.windows(2) {
+            assert!(w[0].1 <= w[1].0, "overlapping ranges {:?} and {:?}", w[0], w[1]);
+        }
+
+        // Free even indices to create fragmentation, reuse holes, then free all.
+        let mut odd = Vec::new();
+        for (idx, (start, end)) in live.into_iter().enumerate() {
+            if idx % 2 == 0 {
+                heap.give_back(start, end);
+            } else {
+                odd.push((start, end));
+            }
+        }
+        assert!(heap.free.len() > 1, "even frees should produce fragmented holes");
+
+        let mut reused = Vec::new();
+        for _ in 0..64 {
+            let apu = heap.take(512, 64).expect("reuse hole");
+            reused.push((apu, apu + 512));
+        }
+        for (start, end) in reused {
+            heap.give_back(start, end);
+        }
+        for (start, end) in odd.into_iter().rev() {
+            heap.give_back(start, end);
+        }
+
+        // Every byte of APU address space must coalesce back into a single free range.
+        assert_eq!(heap.free.len(), 1);
+        assert_eq!(heap.free.get(&APU_BASE), Some(&u32::MAX));
+    }
+
+    #[test]
+    fn apu_alloc_map_unmap_and_free_round_trip() {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut apu: u32 = 0;
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 4096, 4, 0), S_OK);
+        assert!(!ptr.is_null());
+        assert!(apu >= APU_BASE);
+        // Layout promotes alignment to at least 16; APU address matches that alignment.
+        assert_eq!(apu % 16, 0);
+        assert_eq!(ApuMapVirtualAddress(ptr), apu);
+        assert_eq!(ApuMapApuAddress(apu), ptr);
+        // Interior offset maps consistently both ways.
+        // SAFETY: `ptr` is a 4096-byte live allocation.
+        let inner = unsafe { ptr.cast::<u8>().add(123).cast::<c_void>() };
+        assert_eq!(ApuMapVirtualAddress(inner), apu + 123);
+        assert_eq!(ApuMapApuAddress(apu + 123), inner);
+
+        ApuFree(ptr);
+        assert_eq!(ApuMapVirtualAddress(ptr), 0);
+        assert!(ApuMapApuAddress(apu).is_null());
     }
 }

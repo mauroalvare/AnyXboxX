@@ -9,12 +9,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::policy::ensure_outside_repo;
+use crate::policy::{ensure_outside_repo, resolve as resolve_path};
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
     /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
+    /// Folder containing the PC FidelityFX upscaler for the optional FSR profile.
+    pub fidelityfx_dir: Option<PathBuf>,
+    /// Folder containing the PC FidelityFX frame generation DLLs.
+    /// Defaults to the upscaler's folder when no separate path was given.
+    pub ffx_fg_dir: Option<PathBuf>,
+    /// Folder containing NVIDIA's `nvngx_dlss.dll` for the optional DLSS
+    /// profile; without it the driver's own copy runs.
+    pub dlss_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
     /// What titles write and must keep (persistent local storage). Never
@@ -37,6 +45,9 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct FilePaths {
     game_dir: Option<PathBuf>,
+    fidelityfx_dir: Option<PathBuf>,
+    ffx_fg_dir: Option<PathBuf>,
+    dlss_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     #[serde(default)]
@@ -91,8 +102,22 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        if path_starts_with(&resolve_path(&data_dir)?, &resolve_path(&cache_dir)?) {
+            anyhow::bail!(
+                "data directory {} is at or inside the cache directory {}; set VICTORY_DATA_DIR or [paths].data_dir to a location outside the cache",
+                data_dir.display(),
+                cache_dir.display()
+            );
+        }
+        let fidelityfx_dir = env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir);
+        let ffx_fg_dir = env_path("VICTORY_FFX_FG_DIR")
+            .or(file.ffx_fg_dir)
+            .or_else(|| fidelityfx_dir.clone());
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            fidelityfx_dir,
+            ffx_fg_dir,
+            dlss_dir: env_path("VICTORY_DLSS_DIR").or(file.dlss_dir),
             cache_dir,
             data_dir,
             test_titles,
@@ -125,6 +150,43 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
     env("VICTORY_CONFIG")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+#[cfg(windows)]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    // Canonicalization preserves the caller's spelling for components that do not exist yet.
+    let mut path_parts = path.components();
+    root.components().all(|root_part| {
+        let Some(path_part) = path_parts.next() else {
+            return false;
+        };
+        let root_wide: Vec<_> = root_part.as_os_str().encode_wide().collect();
+        let path_wide: Vec<_> = path_part.as_os_str().encode_wide().collect();
+        let (Ok(root_len), Ok(path_len)) = (
+            i32::try_from(root_wide.len()),
+            i32::try_from(path_wide.len()),
+        ) else {
+            return false;
+        };
+        // SAFETY: Each UTF-16 buffer lives through the call and is passed with its exact length.
+        unsafe {
+            CompareStringOrdinal(
+                root_wide.as_ptr(),
+                root_len,
+                path_wide.as_ptr(),
+                path_len,
+                1,
+            ) == CSTR_EQUAL
+        }
+    })
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -174,6 +236,25 @@ mod tests {
     }
 
     #[test]
+    fn frame_generation_prefers_its_path_and_can_use_the_upscalers_folder() {
+        for (file, env_value, wanted) in [
+            ("ffx_fg_dir = 'from-file'", "from-env", "from-env"),
+            ("ffx_fg_dir = 'from-file'", "", "from-file"),
+            ("", "", "upscaler-from-env"),
+        ] {
+            let text = format!("[paths]\nfidelityfx_dir = 'upscaler-from-file'\n{file}");
+            let config: FileConfig = toml::from_str(&text).unwrap();
+            let env = |key: &str| match key {
+                "VICTORY_FFX_FG_DIR" => Some(OsString::from(env_value)),
+                "VICTORY_FIDELITYFX_DIR" => Some(OsString::from("upscaler-from-env")),
+                _ => None,
+            };
+            let config = Config::resolve(config.paths, None, env).unwrap();
+            assert_eq!(config.ffx_fg_dir, Some(PathBuf::from(wanted)));
+        }
+    }
+
+    #[test]
     fn empty_test_titles_env_is_ignored() {
         let file = FilePaths {
             test_titles: vec!["from-file".into()],
@@ -212,6 +293,55 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn persistent_data_cannot_be_inside_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        for data in [cache.clone(), cache.join("saves")] {
+            let file = FilePaths {
+                cache_dir: Some(cache.clone()),
+                data_dir: Some(tmp.path().join("data")),
+                ..Default::default()
+            };
+            let env =
+                |key: &str| (key == "VICTORY_DATA_DIR").then(|| data.clone().into_os_string());
+            let err = Config::resolve(file, None, env).unwrap_err();
+            assert!(err.to_string().contains("cache directory"), "{err}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_data_cannot_use_a_case_alias_of_a_missing_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("CachÉ");
+        let data = tmp.path().join("caché").join("saves");
+        assert!(!cache.exists());
+        assert!(!data.exists());
+        let file = FilePaths {
+            cache_dir: Some(cache),
+            data_dir: Some(data),
+            ..Default::default()
+        };
+        let err = Config::resolve(file, None, |_| None).unwrap_err();
+        assert!(err.to_string().contains("cache directory"), "{err}");
+    }
+
+    #[test]
+    fn adjacent_data_and_cache_directories_are_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("cache-saves");
+        let file = FilePaths {
+            cache_dir: Some(tmp.path().join("cache")),
+            data_dir: Some(data.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Config::resolve(file, None, |_| None).unwrap().data_dir,
+            data
+        );
     }
 
     #[test]

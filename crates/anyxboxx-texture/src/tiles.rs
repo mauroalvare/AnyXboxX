@@ -35,10 +35,18 @@ pub fn linearize_4k_s(payload: &[u8], width: usize, height: usize) -> Result<Vec
     }
     let (columns, rows) = (width.div_ceil(4), height.div_ceil(4));
     let tile_pitch = columns.div_ceil(TILE_BLOCKS);
-    if payload.len() != tile_pitch * rows.div_ceil(TILE_BLOCKS) * TILE_BYTES {
+    let expected = tile_pitch
+        .checked_mul(rows.div_ceil(TILE_BLOCKS))
+        .and_then(|n| n.checked_mul(TILE_BYTES))
+        .ok_or_else(|| "dimensions trop grandes pour cette surface".to_string())?;
+    if payload.len() != expected {
         return Err("tuiles de 4 Kio incomplètes pour cette surface".into());
     }
-    let mut output = vec![0u8; columns * rows * BLOCK_BYTES];
+    let output_bytes = columns
+        .checked_mul(rows)
+        .and_then(|n| n.checked_mul(BLOCK_BYTES))
+        .ok_or_else(|| "dimensions trop grandes pour cette surface".to_string())?;
+    let mut output = vec![0u8; output_bytes];
     for y in 0..rows {
         let tile_row = (y / TILE_BLOCKS) * tile_pitch;
         for x in 0..columns {
@@ -78,4 +86,15 @@ pub fn linearize_4k_s_tail(
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linearize_4k_s_rejects_overflowing_dimensions() {
+        assert!(linearize_4k_s(&[], usize::MAX, 4).is_err());
+        assert!(linearize_4k_s(&[], 1 << 32, 1 << 32).is_err());
+    }
 }

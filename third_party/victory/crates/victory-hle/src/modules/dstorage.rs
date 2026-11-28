@@ -92,9 +92,14 @@ extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
 }
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+    release_with(this, |_| {})
+}
+
+fn release_with<T>(this: *mut Instance<T>, on_last: impl FnOnce(*mut Instance<T>)) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
+        on_last(this);
         // SAFETY: the last reference; created by `Instance::create`.
         drop(unsafe { Box::from_raw(this) });
     }
@@ -122,7 +127,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -145,16 +150,17 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+        stream_log::line(format_args!("F\t{:x}\t{name}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() > 0 {
+        walls_files().insert(file as usize, name);
+    }
     put(out, file)
 }
 
@@ -457,10 +463,18 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    release_with(this, |file| {
+        if let Some(files) = WALLS_FILES.get() {
+            files.lock().unwrap_or_else(|e| e.into_inner()).remove(&(file as usize));
+        }
+    })
+}
+
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -660,9 +674,12 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+/// Paths of live file objects, by address, tracked only for the walls trace.
+static WALLS_FILES: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+
+fn walls_files() -> MutexGuard<'static, HashMap<usize, String>> {
+    WALLS_FILES.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -673,9 +690,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     let file = if request.options & MEMORY_SOURCE != 0 {
         "memory".to_string()
     } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        walls_files().get(&(request.source as usize)).cloned().unwrap_or_else(|| "?".to_owned())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -964,16 +979,20 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Upper bound on the temporary buffers a request may hold while it runs.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    let options = request.options;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let source = u64::from(request.source_size);
+    let mut bytes = if compressed && options & MEMORY_SOURCE == 0 { source } else { 0 };
+    if options & ZLIB != 0 && options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
     }
+    // A destination spread across physical allocations may require a scatter buffer.
+    if options & PAGE_DESTINATION != 0 {
+        bytes += if compressed { u64::from(request.destination_size) } else { source };
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -1497,10 +1516,16 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
+/// The tables shipped with the repository (`bcpack::BUNDLED_TABLES`, an
+/// exception of the asset policy), unless `VICTORY_BCPACK_TABLES` names a
+/// local copy to read instead.
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    match std::env::var_os("VICTORY_BCPACK_TABLES") {
+        Some(path) => read_bcpack_tables(std::path::Path::new(&path)),
+        None => Tables::parse(bcpack::BUNDLED_TABLES)
+            .map_err(|e| format!("invalid bundled BCPack tables: {e}")),
+    }
 }
 
 /// Tests decode streams made against tables of their own, from this folder.
@@ -1515,8 +1540,12 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
     let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
-    let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
-    Tables::parse(&bytes).map_err(|e| e.to_string())
+    read_bcpack_tables(&dir.join("tables.bin"))
+}
+
+fn read_bcpack_tables(path: &std::path::Path) -> Result<Tables, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read BCPack tables: {e}"))?;
+    Tables::parse(&bytes).map_err(|e| format!("invalid BCPack tables: {e}"))
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
@@ -1791,6 +1820,24 @@ mod tests {
             S_OK
         );
         file
+    }
+
+    #[test]
+    fn walls_trace_forgets_a_file_on_its_final_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream.bin");
+        std::fs::write(&path, b"stream data").unwrap();
+        let open_file = open(&path);
+        let key = open_file as usize;
+        let path = path.to_string_lossy().into_owned();
+        walls_files().insert(key, path.clone());
+        let add_ref = call::<extern "system" fn(*mut c_void) -> u32>(open_file, 0x8);
+        let release = call::<extern "system" fn(*mut c_void) -> u32>(open_file, 0x10);
+        assert_eq!(add_ref(open_file), 2);
+        assert_eq!(release(open_file), 1);
+        assert_eq!(walls_files().get(&key), Some(&path));
+        assert_eq!(release(open_file), 0);
+        assert!(!walls_files().contains_key(&key));
     }
 
     fn status_array(capacity: u32) -> *mut c_void {
@@ -2274,6 +2321,35 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_limits_scatter_buffers_for_memory_sources() {
+        let mut lanes = lanes(100);
+        lanes.lanes.insert(0, Lane::new(0, 64));
+        let options = MEMORY_SOURCE | PAGE_DESTINATION;
+        read(&mut lanes, 0, options, 60);
+        read(&mut lanes, 0, options, 60);
+        lanes.submit(0, false);
+        let first = lanes.start().unwrap();
+        assert_eq!(first.staging, 60);
+        assert!(lanes.start().is_none(), "another scatter buffer would exceed 100 bytes");
+        lanes.finish(&first, Ok(()));
+        let second = lanes.start().unwrap();
+        assert_eq!(second.staging, 60);
+        lanes.finish(&second, Ok(()));
+        assert_eq!(lanes.staged, 0);
+    }
+
+    #[test]
+    fn staging_counts_compressed_input_intermediate_and_scatter_storage() {
+        let mut r = request(ZLIB | 2 | PAGE_DESTINATION, std::ptr::null_mut(), 80, std::ptr::null(), 0, 30);
+        r.intermediate_size = 50;
+        assert_eq!(staging_bytes(&r), 30 + 50 + 80);
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&r), 50 + 80);
+        r.options = 0;
+        assert_eq!(staging_bytes(&r), 0);
     }
 
     #[test]

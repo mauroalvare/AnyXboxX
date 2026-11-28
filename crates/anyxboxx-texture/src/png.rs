@@ -37,11 +37,22 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 
 /// Fichier PNG d'une image RGBA8 de `width` × `height`.
 pub fn encode(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
-    if width == 0 || height == 0 || rgba.len() != width * height * 4 {
+    let (Ok(w32), Ok(h32)) = (u32::try_from(width), u32::try_from(height)) else {
+        return Err("dimensions PNG hors limites".into());
+    };
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "taille de l'image RGBA incohérente".to_string())?;
+    if width == 0 || height == 0 || rgba.len() != expected {
         return Err("taille de l'image RGBA incohérente".into());
     }
-    let mut raw = Vec::with_capacity(height * (width * 4 + 1));
-    for row in rgba.chunks_exact(width * 4) {
+    let row_bytes = width * 4;
+    let raw_len = height
+        .checked_mul(row_bytes + 1)
+        .ok_or_else(|| "taille de l'image RGBA incohérente".to_string())?;
+    let mut raw = Vec::with_capacity(raw_len);
+    for row in rgba.chunks_exact(row_bytes) {
         raw.push(0); // filtre « aucun »
         raw.extend_from_slice(row);
     }
@@ -55,12 +66,24 @@ pub fn encode(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, Strin
     }
     zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
     let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&(width as u32).to_be_bytes());
-    header.extend_from_slice(&(height as u32).to_be_bytes());
+    header.extend_from_slice(&w32.to_be_bytes());
+    header.extend_from_slice(&h32.to_be_bytes());
     header.extend_from_slice(&[8, RGBA_COLOUR_TYPE, 0, 0, 0]);
     let mut out = SIGNATURE.to_vec();
     chunk(&mut out, b"IHDR", &header);
     chunk(&mut out, b"IDAT", &zlib);
     chunk(&mut out, b"IEND", &[]);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_rejects_overflowing_and_overwide_dimensions() {
+        assert!(encode(usize::MAX, 1, &[]).is_err());
+        assert!(encode(1 << 31, 1 << 31, &[]).is_err());
+        assert!(encode((u32::MAX as usize).saturating_add(1), 1, &[]).is_err());
+    }
 }

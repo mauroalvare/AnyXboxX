@@ -671,6 +671,8 @@ mod tests {
     /// `VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_UPCOPY_CHECK=1 cargo
     /// test -p victory-gpu --lib upcheck -- --ignored --test-threads=1
     /// <name>`.
+    /// The card-copy tests request a 1 MiB minimum so this 4 MiB buffer
+    /// goes to the card even when its default minimum is 16 MiB.
     const LEN: usize = 4 << 20;
 
     /// Title memory of our own (write-watched, or a view of a section, which
@@ -752,7 +754,7 @@ mod tests {
     /// what it found. Without `VICTORY_FETCH_CHECK` title memory keeps what
     /// was in between, and the next refresh of the 64 KiB sends it up.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_FETCH_CHECK=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_FETCH_CHECK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 and a process of its own"]
     fn a_result_caught_in_between_is_put_right() {
         let Some(host) = host() else {
             return;
@@ -804,7 +806,7 @@ mod tests {
     /// not known. The title writes another byte of the piece: it goes up
     /// whole, with title memory's older bytes, and the check says so.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_UPCOPY_CHECK=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_UPCOPY_CHECK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 and a process of its own"]
     fn the_check_finds_an_undeclared_write_undone() {
         let Some(host) = host() else {
             return;
@@ -837,7 +839,7 @@ mod tests {
     /// A shader that writes through views it picks: its buffer is found when
     /// it comes to it in turn, and what it writes from then on is landed.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=2 VICTORY_PICKED_MB=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=2 VICTORY_PICKED_MB=1 VICTORY_CARD_BUFFERS_MIN_MB=1 and a process of its own"]
     fn writes_through_picked_views_come_back() {
         let Some(host) = host() else {
             return;
@@ -943,9 +945,114 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_MB=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {
         each_reads_its_own(LEN, 0x7777, true);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_PLACED_CONSTANTS=1 and a process of its own"]
+    fn constants_keep_the_value_between_two_placed_copies() {
+        let host = host().expect("this readback needs a host D3D12 device");
+        const BYTES: usize = 256;
+        let (source, src, _source) = title_of(0x7970, false, LEN);
+        let (_title, dst, _dest) = title_of(0x7971, false, LEN);
+        source[..BYTES].fill(0x19);
+        source[BYTES..2 * BYTES].fill(0x43);
+        source[2 * BYTES..3 * BYTES].fill(0x72);
+        let list = host.new_list().unwrap();
+        let (out, mapped) = host.shared_buffer(64 << 10).unwrap();
+
+        assert!(list.place_copy(dst, src, BYTES));
+        assert!(list.snapshot_placed_constants((dst + BYTES) as u64, BYTES as u32).is_none());
+        let (first, first_address) = list.snapshot_placed_constants(dst as u64, BYTES as u32).unwrap();
+
+        let adjacent = dst + BYTES;
+        assert!(list.place_copy(adjacent, src + 2 * BYTES, BYTES));
+        let (third, third_address) = list.snapshot_placed_constants(adjacent as u64, BYTES as u32).unwrap();
+        let (_, reused_address) = list.snapshot_placed_constants(dst as u64, BYTES as u32).unwrap();
+        assert_eq!(reused_address, first_address);
+
+        assert!(list.place_copy(dst, src + BYTES, BYTES));
+        let (second, second_address) = list.snapshot_placed_constants(dst as u64, BYTES as u32).unwrap();
+        assert_ne!(second_address, first_address);
+        let (_, adjacent_address) = list.snapshot_placed_constants(adjacent as u64, BYTES as u32).unwrap();
+        assert_eq!(adjacent_address, third_address);
+
+        let wide = (2 * BYTES) as u32;
+        let (pair, pair_address) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        let (_, reused_pair) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        assert_eq!(reused_pair, pair_address);
+        assert!(list.place_copy(adjacent, src, BYTES));
+        let (updated_pair, updated_address) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        assert_ne!(pair_address, updated_address);
+        let (_, same_head) = list.snapshot_placed_constants(dst as u64, BYTES as u32).unwrap();
+        assert_eq!(same_head, second_address);
+        // SAFETY: an open list, live buffers, and all snapshots held in GENERIC_READ.
+        // These reads run after the last placed copy.
+        unsafe {
+            list.list.CopyBufferRegion(&out, 0, &first, 0, BYTES as u64);
+            list.list.CopyBufferRegion(&out, BYTES as u64, &second, 0, BYTES as u64);
+            list.list.CopyBufferRegion(&out, 2 * BYTES as u64, &third, 0, BYTES as u64);
+            list.list.CopyBufferRegion(&out, 3 * BYTES as u64, &pair, 0, u64::from(wide));
+            list.list.CopyBufferRegion(&out, 5 * BYTES as u64, &updated_pair, 0, u64::from(wide));
+        }
+        list.close();
+        for _ in 0..2 {
+            host.execute_own(&list);
+            settle_now(WHY_SYNC);
+            // SAFETY: the copies completed into a live 64 KiB mapping.
+            let bytes = unsafe { std::slice::from_raw_parts(mapped, 7 * BYTES) };
+            for (block, value) in bytes.chunks_exact(BYTES).zip([0x19u8, 0x43, 0x72, 0x43, 0x72, 0x43, 0x19]) {
+                assert_eq!(block, &[value; BYTES]);
+            }
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_PLACED_CONSTANTS=1 and a process of its own"]
+    fn partial_placed_constants_keep_the_cpu_bytes_around_the_copy() {
+        let host = host().expect("this readback needs a host D3D12 device");
+        const BYTES: usize = 256;
+        let (source, src, _source) = title_of(0x7972, false, LEN);
+        let (initial, dst, destination) = title_of(0x7973, false, LEN);
+        source[..BYTES].fill(0x19);
+        source[BYTES..2 * BYTES].fill(0x43);
+        initial[..2 * BYTES].fill(0x72);
+        let list = host.new_list().unwrap();
+        let (out, mapped) = host.shared_buffer(64 << 10).unwrap();
+
+        assert!(list.place_copy(dst, src, BYTES));
+        let wide = (2 * BYTES) as u32;
+        let (mixed, mixed_address) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        let (_, repeated) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        assert_eq!(repeated, mixed_address);
+
+        destination.gpu_writes(&list, (dst + 3 * BYTES) as u64, BYTES as u64);
+        let (_, disjoint) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        assert_eq!(disjoint, mixed_address);
+
+        destination.gpu_writes(&list, (dst + BYTES) as u64, BYTES as u64);
+        let (_, refreshed) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+        assert_ne!(refreshed, mixed_address);
+        assert!(list.place_copy(dst + BYTES, src + BYTES, BYTES));
+        let (updated, _) = list.snapshot_placed_constants(dst as u64, wide).unwrap();
+
+        // SAFETY: both snapshots and the readback buffer are live and large enough.
+        unsafe {
+            list.list.CopyBufferRegion(&out, 0, &mixed, 0, u64::from(wide));
+            list.list.CopyBufferRegion(&out, u64::from(wide), &updated, 0, u64::from(wide));
+        }
+        list.close();
+        host.execute_own(&list);
+        settle_now(WHY_SYNC);
+        // SAFETY: the copies completed into a live 64 KiB mapping.
+        let bytes = unsafe { std::slice::from_raw_parts(mapped, 4 * BYTES) };
+        for (block, value) in bytes.chunks_exact(BYTES).zip([0x19u8, 0x72, 0x19, 0x43]) {
+            assert_eq!(block, &[value; BYTES]);
+        }
+        assert_eq!(host.log_messages(), None);
     }
 
     #[test]
@@ -1194,7 +1301,7 @@ mod tests {
     /// the end title memory and the card hold what each wrote last. (A byte
     /// is written by flights or by the title, not both at a time.)
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_BUFFERS_MIN_MB=1 and a process of its own"]
     fn declared_writes_beside_the_titles_own_stay() {
         let Some(host) = host() else {
             return;

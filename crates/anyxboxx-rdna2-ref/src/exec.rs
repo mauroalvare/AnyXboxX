@@ -44,11 +44,18 @@ fn execute_vector(
     if vector::is_no_operation(name) {
         return Ok(true);
     }
+    if crate::f16::supports(name) {
+        crate::f16::execute(wave, name, family, word, literal)?;
+        return Ok(true);
+    }
     let fields = vector::fields(family, word);
     let carry = family == "VOP2" && vector::is_carry(name);
     if EXTENSION_CODES.contains(&(word & 0x1FF)) {
-        if crate::wide::spec(name).is_some() || crate::movrel::is_vector(name) {
-            // 64-bit operations take no extension word: refused before any lane, as the Python does.
+        if crate::wide::spec(name).is_some()
+            || crate::movrel::is_vector(name)
+            || crate::f16_trans::supports(name)
+        {
+            // 64-bit, movrel and f16 transcendental operations take no extension word: refused before any lane.
             return Err(Error::Untranslated(format!(
                 "instruction non traduite : {name} (SDWA/DPP)"
             )));
@@ -78,6 +85,10 @@ fn execute_vector(
         )?;
         return Ok(true);
     }
+    if family == "VOP1" && crate::f16_trans::supports(name) {
+        crate::f16_trans::execute(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if carry {
         return vector::execute_carry(wave, name, &fields, literal);
     }
@@ -94,6 +105,10 @@ fn execute_compare(
     literal: Option<u32>,
 ) -> Result<bool, Error> {
     let (src0, vsrc1) = (word & 0x1FF, (word >> 9) & 0xFF);
+    if crate::cmpf16::supports(name) {
+        crate::cmpf16::execute(wave, name, src0, vsrc1, literal)?;
+        return Ok(true);
+    }
     if EXTENSION_CODES.contains(&src0) && ext_compare::supports(name) {
         if src0 != ext::SDWA {
             return Err(ext_compare::refuse_dpp(name, src0 == ext::DPP16));
@@ -275,6 +290,11 @@ pub fn step(wave: &mut Wave, data: &[u8]) -> Result<bool, Error> {
         if !execute_compare(wave, &name, word, literal)? {
             return Err(refused());
         }
+        wave.pc = next_pc;
+        return Ok(true);
+    }
+    if family == "VOP1" && crate::f16conv::supports(&name) {
+        crate::f16conv::execute(wave, &name, word, literal)?;
         wave.pc = next_pc;
         return Ok(true);
     }

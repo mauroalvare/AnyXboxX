@@ -225,3 +225,167 @@ fn a_malformed_relocation_block_is_refused_not_skipped() {
         Err(LoadError::Relocation(_))
     ));
 }
+
+const COFF: usize = 0x80 + 4;
+const OPTIONAL: usize = COFF + 20;
+const SECTION: usize = OPTIONAL + 240;
+const IMAGE_SIZE: usize = OPTIONAL + 56;
+const HEADER_SIZE: usize = OPTIONAL + 60;
+
+#[path = "read_pe/layout_compat.rs"]
+mod layout_compat;
+
+fn put_u32(file: &mut [u8], offset: usize, value: u32) {
+    file[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn refuse_before_base_allocation(file: &[u8]) -> LoadError {
+    read_pe(file, |_, _, _| {
+        panic!("malformed layout reached the base allocator")
+    })
+    .unwrap_err()
+}
+
+#[test]
+fn image_dimensions_are_bounded_on_both_entry_points() {
+    let (mut file, _) = Pe::default().build();
+    put_u32(&mut file, IMAGE_SIZE, 0);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::BadHeaders
+    ));
+
+    let maximum = anyxboxx_pe::MAX_IMAGE;
+    put_u32(&mut file, IMAGE_SIZE, maximum as u32);
+    let pages = page_protections(&file).unwrap();
+    assert_eq!(pages.len() as u64, maximum / anyxboxx_pe::PAGE);
+    assert_eq!(pages[0], PROT_READ);
+    assert_eq!(pages[1], PROT_READ | PROT_WRITE | PROT_EXEC);
+    assert_eq!(pages[2], PROT_READ);
+
+    put_u32(&mut file, IMAGE_SIZE, (maximum + anyxboxx_pe::PAGE) as u32);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::TooLarge
+    ));
+    assert!(matches!(page_protections(&file), Err(LoadError::TooLarge)));
+}
+
+#[test]
+fn header_size_and_section_count_are_checked() {
+    let (mut file, _) = Pe::default().build();
+    put_u32(&mut file, HEADER_SIZE, SECTION as u32);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::HeaderRange
+    ));
+
+    let (mut file, _) = Pe::default().build();
+    file[COFF + 2..COFF + 4].copy_from_slice(&97u16.to_le_bytes());
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::SectionCount(97)
+    ));
+}
+
+#[test]
+fn raw_truncation_and_ranges_that_wrap_u32_are_rejected() {
+    let (mut file, _) = Pe::default().build();
+    file.pop();
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::RawSection(0x1000)
+    ));
+    assert!(matches!(
+        page_protections(&file),
+        Err(LoadError::RawSection(0x1000))
+    ));
+
+    let (mut file, _) = Pe::default().build();
+    put_u32(&mut file, SECTION + 20, 0xFFFF_FE00);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::RawSection(0x1000)
+    ));
+    put_u32(&mut file, SECTION + 12, 0xFFFF_F000);
+    put_u32(&mut file, SECTION + 8, 0x2000);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::Section(0xFFFF_F000)
+    ));
+}
+
+#[test]
+fn virtual_overlap_and_malformed_alignment_are_rejected() {
+    let (mut file, _) = Pe::default().build();
+    file[COFF + 2..COFF + 4].copy_from_slice(&2u16.to_le_bytes());
+    put_u32(&mut file, SECTION + 40 + 8, 0x100);
+    put_u32(&mut file, SECTION + 40 + 12, 0x1000);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::Section(0x1000)
+    ));
+
+    let (mut file, _) = Pe::default().build();
+    put_u32(&mut file, OPTIONAL + 36, 3);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::Alignment
+    ));
+}
+
+#[test]
+fn data_directories_are_bounded_in_their_address_space() {
+    let (mut file, _) = Pe::default().build();
+    file.resize(0x2110, 0);
+    Pe::set_directory(&mut file, 4, 0x2100, 16);
+    load(&file).expect("a certificate table uses file offsets outside the mapped image");
+    Pe::set_directory(&mut file, 4, 0x2100, 17);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::DirectoryRange(4)
+    ));
+    Pe::set_directory(&mut file, 4, 0, 0);
+    Pe::set_directory(&mut file, 1, u32::MAX - 1, 8);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::DirectoryRange(1)
+    ));
+}
+
+#[test]
+fn relocation_target_range_is_checked_before_base_allocation() {
+    let (mut file, _) = Pe {
+        pointers: vec![(0x80, 0x10)],
+        ..Pe::default()
+    }
+    .build();
+    let header = anyxboxx_pe::Headers::read(&file).unwrap();
+    let (rva, _) = header.directory(5);
+    let section = header.sections[0];
+    let reloc = (section.raw_offset + rva - section.virtual_address) as usize;
+    put_u32(&mut file, reloc, 0xFFFF_F000);
+    assert!(matches!(
+        refuse_before_base_allocation(&file),
+        LoadError::Relocation(_)
+    ));
+}
+
+#[test]
+fn a_relocation_table_across_two_sections_can_be_mapped() {
+    let (mut file, _) = Pe::default().build();
+    file.resize(0x1600, 0);
+    file[COFF + 2..COFF + 4].copy_from_slice(&2u16.to_le_bytes());
+    put_u32(&mut file, IMAGE_SIZE, 0x3000);
+    put_u32(&mut file, SECTION + 8, 0x1000);
+    put_u32(&mut file, SECTION + 16, 0x1000);
+    put_u32(&mut file, SECTION + 40 + 8, 0x200);
+    put_u32(&mut file, SECTION + 40 + 12, 0x2000);
+    put_u32(&mut file, SECTION + 40 + 16, 0x200);
+    put_u32(&mut file, SECTION + 40 + 20, 0x1400);
+    Pe::set_directory(&mut file, 5, 0x1FFC, 12);
+    put_u32(&mut file, 0x13FC, 0x1000);
+    put_u32(&mut file, 0x1400, 12);
+    file[0x1404..0x1406].copy_from_slice(&0xA008u16.to_le_bytes());
+    assert!(read_pe(&file, forced(MOVED)).unwrap().relocated);
+}

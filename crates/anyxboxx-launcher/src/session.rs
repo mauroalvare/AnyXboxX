@@ -18,6 +18,8 @@ use anyxboxx::run::Victory;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub game_dir: String,
+    /// The AnyXboxX clone chosen in Setup, empty for none (then it is searched for).
+    pub repo_dir: String,
     /// The advanced panel: one `KEY=VALUE` per line.
     pub overrides: String,
     /// Path of the user's own `xg_xs.dll`, empty for none.
@@ -39,6 +41,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             game_dir: String::new(),
+            repo_dir: String::new(),
             overrides: String::new(),
             xg_dll: String::new(),
             xg_mode: XgMode::Real,
@@ -66,6 +69,12 @@ impl Settings {
         (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
     }
 
+    /// The AnyXboxX folder chosen in Setup, when one was saved.
+    pub fn repo_path(&self) -> Option<PathBuf> {
+        let trimmed = self.repo_dir.trim().trim_matches('"');
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    }
+
     /// The jobs limit, `None` for every core.
     pub fn jobs_limit(&self) -> Option<usize> {
         (self.jobs > 0).then_some(self.jobs as usize)
@@ -78,10 +87,13 @@ pub fn make_plan(
     repo: &Path,
     victory_exe: Option<&Path>,
     profile: &Profile,
+    fg_available: bool,
 ) -> Result<Plan, SessionError> {
     let game_dir = settings.game_path().ok_or(SessionError::NoGameFolder)?;
     let mut overrides = settings.options.env_pairs();
-    overrides.extend(env::parse_overrides(&settings.overrides)?);
+    let advanced = env::parse_overrides(&settings.overrides)?;
+    overrides.extend(settings.options.dlss.env_pairs(fg_available, &advanced));
+    overrides.extend(advanced);
     let xg_text = settings.xg_dll.trim().trim_matches('"');
     let xg = (!xg_text.is_empty()).then(|| Xg {
         dll: PathBuf::from(xg_text),
@@ -99,6 +111,7 @@ pub fn make_plan(
             &env,
             &game_dir,
             settings.always_rewarm,
+            settings.options.warm_first,
             marker,
         )
     });
@@ -165,7 +178,7 @@ mod tests {
     fn plan_needs_a_game_folder() {
         let settings = Settings::default();
         assert!(matches!(
-            make_plan(&settings, Path::new("."), None, &profile()),
+            make_plan(&settings, Path::new("."), None, &profile(), true),
             Err(SessionError::NoGameFolder)
         ));
     }
@@ -178,7 +191,7 @@ mod tests {
             jobs: 6,
             ..Settings::default()
         };
-        let plan = make_plan(&settings, Path::new("repo"), None, &profile()).expect("plan");
+        let plan = make_plan(&settings, Path::new("repo"), None, &profile(), true).expect("plan");
         assert_eq!(plan.jobs, Some(6));
         assert_eq!(plan.game_dir, dir.path());
         assert!(plan.env.iter().any(|(k, _)| k == "VICTORY_CARD_WINDOWS_MB"));
@@ -201,7 +214,7 @@ mod tests {
             overrides: "VICTORY_SHADER_OPT=12".to_string(),
             ..Settings::default()
         };
-        let plan = make_plan(&settings, Path::new("repo"), None, &profile()).expect("plan");
+        let plan = make_plan(&settings, Path::new("repo"), None, &profile(), true).expect("plan");
         let value = plan
             .env
             .iter()
@@ -219,9 +232,42 @@ mod tests {
             ..Settings::default()
         };
         assert!(matches!(
-            make_plan(&settings, Path::new("repo"), None, &profile()),
+            make_plan(&settings, Path::new("repo"), None, &profile(), true),
             Err(SessionError::Env(EnvError::Key(1, _)))
         ));
+    }
+
+    #[test]
+    fn advanced_dlss_settings_win_and_the_final_folder_is_checked() {
+        let game = game_folder();
+        let sdk = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            game_dir: game.path().display().to_string(),
+            overrides: format!(
+                "VICTORY_STREAMLINE_DIR={}\nVICTORY_DLSS_MODE=balanced\nVICTORY_UPSCALER=3",
+                sdk.path().display()
+            ),
+            ..Settings::default()
+        };
+        settings.options.dlss.super_resolution = true;
+        let plan = make_plan(&settings, Path::new("."), None, &profile(), true).unwrap();
+        let lines = env::describe(&plan.env);
+        assert!(lines.contains(&"VICTORY_DLSS_MODE=balanced".into()));
+        assert!(lines.contains(&"VICTORY_UPSCALER=3".into()));
+        let refusal = crate::streamline::check_launch(&plan.env).unwrap_err();
+        assert!(
+            refusal.contains("sl.interposer.dll")
+                && refusal.contains(&*sdk.path().display().to_string())
+        );
+        settings.overrides = "VICTORY_DLSS=0".into();
+        let plan = make_plan(&settings, Path::new("."), None, &profile(), true).unwrap();
+        assert!(crate::streamline::check_launch(&plan.env).is_ok());
+        // The profile itself may set the upscaler (the local player build does);
+        // what the options add must not.
+        let advanced = env::parse_overrides(&settings.overrides).unwrap();
+        let added = settings.options.dlss.env_pairs(true, &advanced);
+        assert!(!added.iter().any(|(k, _)| k == "VICTORY_UPSCALER"));
+        assert!(plan.env.iter().any(|(k, v)| k == "VICTORY_DLSS" && v == "0"));
     }
 
     #[test]
@@ -232,7 +278,7 @@ mod tests {
             xg_dll: "Z:/nowhere/xg_xs.dll".to_string(),
             ..Settings::default()
         };
-        assert!(make_plan(&settings, Path::new("repo"), None, &profile()).is_err());
+        assert!(make_plan(&settings, Path::new("repo"), None, &profile(), true).is_err());
     }
 
     #[test]
@@ -246,7 +292,7 @@ mod tests {
             game_dir: dir.path().display().to_string(),
             ..Settings::default()
         };
-        let plan = make_plan(&settings, Path::new(""), Some(&exe), &profile()).expect("plan");
+        let plan = make_plan(&settings, Path::new(""), Some(&exe), &profile(), true).expect("plan");
         assert_eq!(plan.victory_exe.as_deref(), Some(exe.as_path()));
         assert!(
             plan.warm.is_some(),

@@ -243,7 +243,11 @@ pub fn compute(name: &str, a: u32, b: u32, d: u32, k: u32, c: bool) -> Option<u3
             bits_float(b),
             bits_float(d),
         ))),
-        "v_mac_f32" => u64::from(float_bits(bits_float(a) * bits_float(b) + bits_float(d))),
+        "v_mac_f32" => u64::from(float_bits(float::mul_add(
+            bits_float(a),
+            bits_float(b),
+            bits_float(d),
+        ))),
         "v_fmamk_f32" => u64::from(float_bits(float::fma(
             bits_float(a),
             bits_float(k),
@@ -254,8 +258,16 @@ pub fn compute(name: &str, a: u32, b: u32, d: u32, k: u32, c: bool) -> Option<u3
             bits_float(b),
             bits_float(k),
         ))),
-        "v_madmk_f32" => u64::from(float_bits(bits_float(a) * bits_float(k) + bits_float(b))),
-        "v_madak_f32" => u64::from(float_bits(bits_float(a) * bits_float(b) + bits_float(k))),
+        "v_madmk_f32" => u64::from(float_bits(float::mul_add(
+            bits_float(a),
+            bits_float(k),
+            bits_float(b),
+        ))),
+        "v_madak_f32" => u64::from(float_bits(float::mul_add(
+            bits_float(a),
+            bits_float(b),
+            bits_float(k),
+        ))),
         "v_fmac_legacy_f32" => {
             let (x, y, z) = (bits_float(a), bits_float(b), bits_float(d));
             u64::from(float_bits(float::legacy_fma(x, y, z)))

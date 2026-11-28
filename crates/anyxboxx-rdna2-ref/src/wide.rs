@@ -246,9 +246,11 @@ pub fn execute(
                 "instruction non traduite : {name} (64 bits)"
             )));
         };
-        wave.v[vdst as usize][lane] = (value & MASK32) as u32;
+        let width = if result.is_wide() { 2 } else { 1 };
+        let destination = wave.vgpr_group(vdst as usize, width)?;
+        wave.v[destination][lane] = (value & MASK32) as u32;
         if result.is_wide() {
-            wave.v[vdst as usize + 1][lane] = ((value >> 32) & MASK32) as u32;
+            wave.v[destination + 1][lane] = ((value >> 32) & MASK32) as u32;
         }
     }
 
@@ -276,6 +278,44 @@ mod tests {
         assert!(
             rounded(f64::from_bits(0x7FF0_0000_0000_0001), f64::floor).to_bits() & QUIET_F64 != 0
         );
+    }
+
+    #[test]
+    fn a_64_bit_result_at_v255_is_refused_without_mutation() {
+        // v_lshlrev_b64 v[255:256], 4, v[2:3]: v256 does not exist.
+        let mut wave = Wave::new(32).unwrap();
+        wave.v[2] = vec![1; 32];
+        wave.v[255] = vec![0x1234_5678; 32];
+        let codes = [132, 256 + 2];
+        let refused = execute(
+            &mut wave,
+            "v_lshlrev_b64",
+            &codes,
+            255,
+            None,
+            0,
+            0,
+            false,
+            0,
+        );
+        assert!(matches!(refused, Err(Error::Operand(_))));
+        assert!(wave.v[255].iter().all(|&value| value == 0x1234_5678));
+        // One register lower, the pair v254:v255 fits.
+        assert!(
+            execute(
+                &mut wave,
+                "v_lshlrev_b64",
+                &codes,
+                254,
+                None,
+                0,
+                0,
+                false,
+                0
+            )
+            .unwrap()
+        );
+        assert_eq!((wave.v[254][0], wave.v[255][0]), (0x10, 0));
     }
 
     #[test]

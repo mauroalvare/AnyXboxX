@@ -22,11 +22,15 @@ const FH_CHARACTERISTICS: usize = 18;
 // IMAGE_OPTIONAL_HEADER64 fields (offsets from the optional header).
 const OPT_MAGIC: usize = 0;
 const OPT_IMAGE_BASE: usize = 24;
+const OPT_SECTION_ALIGNMENT: usize = 32;
+const OPT_FILE_ALIGNMENT: usize = 36;
 const OPT_SIZE_OF_IMAGE: usize = 56;
 const OPT_SIZE_OF_HEADERS: usize = 60;
 
 // IMAGE_SECTION_HEADER: 40 bytes each.
 const SECTION_HEADER_SIZE: usize = 40;
+/// Maximum number of sections accepted by the Windows image loader.
+const MAX_SECTIONS: usize = 96;
 const SH_VIRTUAL_SIZE: usize = 8;
 const SH_VIRTUAL_ADDRESS: usize = 12;
 const SH_SIZE_OF_RAW_DATA: usize = 16;
@@ -43,6 +47,19 @@ pub struct Section {
     pub characteristics: u32,
 }
 
+impl Section {
+    pub(crate) fn mapped_size(&self) -> u32 {
+        match self.virtual_size {
+            0 => self.raw_size,
+            size => size,
+        }
+    }
+
+    pub(crate) fn copied_size(&self) -> u32 {
+        self.raw_size.min(self.mapped_size())
+    }
+}
+
 /// The header fields the loader uses.
 #[derive(Debug, Clone)]
 pub struct Headers {
@@ -52,6 +69,9 @@ pub struct Headers {
     pub size_of_image: u32,
     pub size_of_headers: u32,
     pub sections: Vec<Section>,
+    pub(crate) section_alignment: u32,
+    pub(crate) file_alignment: u32,
+    pub(crate) section_table_end: usize,
     data: Vec<(u32, u32)>,
 }
 
@@ -70,18 +90,38 @@ impl Headers {
         if machine != MACHINE_AMD64 || u16_at(data, opt + OPT_MAGIC)? != MAGIC_PE32_PLUS {
             return Err(LoadError::NotPe32Plus);
         }
-        let section_table = opt + usize::from(u16_at(data, file + FH_SIZE_OF_OPTIONAL_HEADER)?);
+        let section_table = opt
+            .checked_add(usize::from(u16_at(
+                data,
+                file + FH_SIZE_OF_OPTIONAL_HEADER,
+            )?))
+            .ok_or_else(truncated)?;
         let count = usize::from(u16_at(data, file + FH_NUMBER_OF_SECTIONS)?);
+        if count > MAX_SECTIONS {
+            return Err(LoadError::SectionCount(count));
+        }
+        let table_end = section_table
+            .checked_add(count * SECTION_HEADER_SIZE)
+            .ok_or_else(truncated)?;
+        let optional = data.get(opt..section_table).ok_or_else(truncated)?;
+        let size_of_headers = u32_at(optional, OPT_SIZE_OF_HEADERS)?;
+        let header_len = size_of_headers as usize;
+        if table_end > header_len.min(data.len()) {
+            return Err(LoadError::HeaderRange);
+        }
         Ok(Headers {
             characteristics: u16_at(data, file + FH_CHARACTERISTICS)?,
-            image_base: read_u64(data, opt + OPT_IMAGE_BASE).ok_or_else(truncated)?,
-            entry_rva: u32_at(data, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT)?,
-            size_of_image: u32_at(data, opt + OPT_SIZE_OF_IMAGE)?,
-            size_of_headers: u32_at(data, opt + OPT_SIZE_OF_HEADERS)?,
+            image_base: read_u64(optional, OPT_IMAGE_BASE).ok_or_else(truncated)?,
+            entry_rva: u32_at(optional, layout::OPT_ADDRESS_OF_ENTRY_POINT)?,
+            size_of_image: u32_at(optional, OPT_SIZE_OF_IMAGE)?,
+            size_of_headers,
+            section_alignment: u32_at(optional, OPT_SECTION_ALIGNMENT)?,
+            file_alignment: u32_at(optional, OPT_FILE_ALIGNMENT)?,
+            section_table_end: table_end,
             sections: (0..count)
                 .map(|index| read_section(data, section_table + index * SECTION_HEADER_SIZE))
                 .collect::<Result<_, _>>()?,
-            data: read_directories(data)?,
+            data: read_directories(optional)?,
         })
     }
 
@@ -100,15 +140,13 @@ impl Headers {
     }
 }
 
-fn read_directories(data: &[u8]) -> Result<Vec<(u32, u32)>, LoadError> {
-    let mut directories = Vec::new();
-    while let Some(at) = layout::data_directory_offset(data, directories.len()) {
-        if directories.len() == MAX_DIRECTORIES {
-            break;
-        }
-        directories.push((u32_at(data, at)?, u32_at(data, at + 4)?));
-    }
-    Ok(directories)
+fn read_directories(optional: &[u8]) -> Result<Vec<(u32, u32)>, LoadError> {
+    let count = u32_at(optional, layout::OPT_NUMBER_OF_RVA_AND_SIZES)? as usize;
+    optional[layout::OPT_DATA_DIRECTORY..]
+        .chunks_exact(layout::DATA_DIRECTORY_SIZE)
+        .take(count.min(MAX_DIRECTORIES))
+        .map(|entry| Ok((u32_at(entry, 0)?, u32_at(entry, 4)?)))
+        .collect()
 }
 
 /// The PE format defines 16 data directories; a larger `NumberOfRvaAndSizes` is ignored.

@@ -22,15 +22,16 @@ GOLDEN = REPO / "tests" / "fixtures" / "lancer_victory_vicetay.ps1"
 SETTINGS = REPO / "crates" / "anyxboxx" / "src" / "run" / "settings.rs"
 CARGO_FAILURE, VICTORY_EXIT = 101, 7
 GAME_DIR = "VICTORY_GAME_DIR=<root>\\game"
-BUILD = r"cargo build --release -p victory --manifest-path <root>\depot\third_party\victory\Cargo.toml | "
+BUILD = (r"cargo build --release -p victory --manifest-path <root>\depot\third_party\victory\Cargo.toml "
+         "--message-format=json-render-diagnostics | ")
 BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics "
-              r"--manifest-path <root>\depot\third_party\victory\Cargo.toml | ")
+              r"--manifest-path <root>\depot\third_party\victory\Cargo.toml --message-format=json-render-diagnostics | ")
 GAME = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_DIAG = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_ARCHIVES = r"<root>\game\A.rpf <root>\game\b.rpf"
-WARM_ARCHIVES = (r"victory warm <root>\game\A.rpf <root>\game\b.rpf | ")
-WARM_PRECOMPILE = (r"victory warm <root>\game\shaders.rpf <root>\game\game_scarlett_master.exe "
-                   r"<root>\game\XboxBvhBuilder.dll <root>\game\amd_fidelityfx_upscaler_xbox.dll | ")
+# Vice-Tay's `warm` takes no files: it remakes the pipelines earlier runs noted.
+WARM_ARCHIVES = r"victory warm | "
+WARM_PRECOMPILE = r"victory warm | "
 
 
 # ---- the golden script and the Rust settings ------------------------------------------------
@@ -101,6 +102,20 @@ public static class FakeTool {
         string key = "FAKE_TOOL_EXIT_" + name.ToUpperInvariant();
         string code = Environment.GetEnvironmentVariable(args.Length > 0 ? key + "_" + args[0].ToUpperInvariant() : key)
                       ?? Environment.GetEnvironmentVariable(key);
+        if (name == "cargo" && args.Contains("--message-format=json-render-diagnostics")) {
+            Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+            string exe = Environment.GetEnvironmentVariable("FAKE_CARGO_ARTIFACT");
+            if (exe == null) {
+                string profile = args.Contains("--profile") ? "diag" : "release";
+                exe = Path.Combine(Environment.GetEnvironmentVariable("CARGO_TARGET_DIR"), profile, "victory.exe");
+            }
+            Console.WriteLine("{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"victory\",\"kind\":[\"lib\"]},\"executable\":\"ignored.exe\"}");
+            int count = int.Parse(Environment.GetEnvironmentVariable("FAKE_CARGO_ARTIFACT_COUNT") ?? "1");
+            for (int i = 0; i < count; i++) {
+                Console.WriteLine("{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"victory\",\"kind\":[\"bin\"]},\"executable\":\""
+                                  + exe.Replace("\\", "\\\\") + "\"}");
+            }
+        }
         return string.IsNullOrEmpty(code) ? 0 : int.Parse(code);
     }
 }
@@ -130,7 +145,7 @@ def binary():
 
 
 def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=True, precompile_inputs=False,
-           archives=("A.rpf", "b.rpf")):
+           archives=("A.rpf", "b.rpf"), logical_cpus=8, inherited=()):
     """Runs `anyxboxx run` in a fake repository; returns (process, calls with <root> for tmp_path)."""
     manifest = tmp_path / "depot" / "third_party" / "victory" / "Cargo.toml"
     manifest.parent.mkdir(parents=True)
@@ -154,6 +169,9 @@ def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=Tr
     shutil.copy(fake_tool, tmp_path / "prebuilt" / "prebuilt.exe")
     log = tmp_path / "calls.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("VICTORY_")}
+    env.update(inherited)
+    # The golden set is the 8-core one: pin the CPU count so the result does not depend on this machine.
+    env["ANYXBOXX_LOGICAL_CPUS"] = str(logical_cpus)
     env.update({"PATH": f"{tmp_path / 'tools'}{os.pathsep}{os.environ['PATH']}",
                 "CARGO_TARGET_DIR": str(tmp_path / "target"), "FAKE_TOOL_LOG": str(log),
                 "FAKE_TOOL_EXIT_CARGO": str(cargo_exit), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT),
@@ -182,6 +200,17 @@ def test_the_default_environment_equals_the_scripts_default(tmp_path, fake_tool,
     assert sorted(logged) == sorted(expected), done.stderr
 
 
+def test_sixteen_or_more_logical_cpus_get_the_bigger_worker_pools(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, logical_cpus=24)
+    logged = calls[1].split(" | ", 1)[1].split(";")
+    for pair in ("VICTORY_THIN_THREADS=12", "VICTORY_UNDER_THREADS=8", "VICTORY_LAND_THREADS=8"):
+        assert pair in logged, (pair, done.stderr)
+    user = tmp_path / "user"
+    user.mkdir()
+    done, calls = launch(user, fake_tool, binary, ["--override", "VICTORY_LAND_THREADS=5"], logical_cpus=24)
+    assert "VICTORY_LAND_THREADS=5" in calls[1].split(" | ", 1)[1].split(";"), done.stderr
+
+
 def test_quality_applies_the_golden_quality_set_after_the_tuned_set(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--quality"])
     logged = calls[1].split(" | ", 1)[1].split(";")
@@ -208,6 +237,20 @@ def test_override_wins_over_quality_and_the_tuned_set(tmp_path, fake_tool, binar
     assert "VICTORY_RELAY=0" in logged and "VICTORY_RELAY=2" not in logged, done.stderr
 
 
+def test_overrides_apply_to_warm_and_run_after_all_switches(tmp_path, fake_tool, binary):
+    options = ["--warm", "--no-tuned-settings", "--auto-a", "--frametime-dump", "--xg-dll", "{xg}",
+               "--override", "VICTORY_AUTO_A=30", "--override", "VICTORY_FRAMETIME_DUMP=",
+               "--override", "VICTORY_XG_MODE=compare", "--override", "VICTORY_D3D12_DRED="]
+    inherited = (("VICTORY_D3D12_DRED", "1"), ("VICTORY_FRAMETIME_DUMP", "parent"))
+    done, calls = launch(tmp_path, fake_tool, binary, options, inherited=inherited)
+    expected = (GAME_DIR, "VICTORY_DISCORD=0", "VICTORY_AUTO_A=30",
+                r"VICTORY_XG_DLL=<root>\xg_xs.dll", "VICTORY_XG_MODE=compare")
+    env = ";".join(sorted(expected))
+    assert calls == [BUILD + "VICTORY_D3D12_DRED=1;VICTORY_FRAMETIME_DUMP=parent",
+                     WARM_ARCHIVES + env, GAME + env], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
 def test_auto_a_and_frametime_dump_are_set_when_asked(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--auto-a", "--frametime-dump"])
     logged = calls[1].split(" | ", 1)[1].split(";")
@@ -227,6 +270,12 @@ def test_diag_builds_the_diagnostics_profile(tmp_path, fake_tool, binary):
     assert calls[0] == BUILD_DIAG, done.stderr
 
 
+def test_skip_pipelines_keeps_the_release_build(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--skip-pipelines", "0123456789abcdef"])
+    assert calls == [BUILD, GAME + default_env(("VICTORY_SKIP_PIPELINES=0123456789abcdef",))], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
 def test_the_users_xg_library_is_passed_with_its_mode(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--no-tuned-settings", "--xg-dll", "{xg}", "--xg-mode", "compare"])
     expected = (GAME_DIR, "VICTORY_DISCORD=0",
@@ -234,10 +283,16 @@ def test_the_users_xg_library_is_passed_with_its_mode(tmp_path, fake_tool, binar
     assert calls == [BUILD, GAME + ";".join(sorted(expected))], done.stderr
 
 
-def test_a_missing_xg_library_stops_after_the_build(tmp_path, fake_tool, binary):
+def test_a_missing_xg_library_stops_before_the_build(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--xg-dll", "missing.dll"])
-    assert calls == [BUILD] and done.returncode == 1
+    assert calls == [] and done.returncode == 1
     assert "xg_xs.dll not found" in done.stderr
+
+
+def test_invalid_override_stops_before_building(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--override", "PATH=x"])
+    assert calls == [] and done.returncode != 0
+    assert "--override takes VICTORY_* names only" in done.stderr
 
 
 def test_warm_runs_the_game_archives_only_before_the_game(tmp_path, fake_tool, binary):
@@ -247,7 +302,7 @@ def test_warm_runs_the_game_archives_only_before_the_game(tmp_path, fake_tool, b
 
 def test_warm_needs_an_archive(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--warm"], archives=())
-    assert calls == [BUILD] and done.returncode == 1
+    assert calls == [] and done.returncode == 1
     assert "no .rpf archive" in done.stderr
 
 
@@ -261,7 +316,19 @@ def test_precompile_warms_the_shader_archive_and_binaries_with_the_game_environm
 
 def test_precompile_needs_the_shader_archive(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--precompile"])
-    assert calls == [BUILD] and done.returncode == 1
+    assert calls == [] and done.returncode == 1
+    assert "shaders.rpf" in done.stderr
+
+
+def test_warm_and_precompile_share_one_pipeline_warm(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--warm", "--precompile"], precompile_inputs=True)
+    assert calls == [BUILD, WARM_ARCHIVES + default_env(), GAME + default_env()], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
+def test_warm_and_precompile_validate_before_starting_either(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--warm", "--precompile"])
+    assert calls == [] and done.returncode == 1
     assert "shaders.rpf" in done.stderr
 
 
@@ -269,6 +336,26 @@ def test_a_failed_build_stops_the_launch(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, cargo_exit=CARGO_FAILURE)
     assert calls == [BUILD] and done.returncode == 1
     assert f"cargo build failed (exit code {CARGO_FAILURE})" in done.stderr
+
+
+def test_cargo_reported_executable_runs_warm_and_game(tmp_path, fake_tool, binary, monkeypatch):
+    output = tmp_path / "répertoire Cargo" / "reported.exe"
+    output.parent.mkdir()
+    shutil.copy(fake_tool, output)
+    monkeypatch.setenv("FAKE_CARGO_ARTIFACT", str(output))
+    monkeypatch.setenv("FAKE_TOOL_EXIT_REPORTED_RUN", str(VICTORY_EXIT))
+    done, calls = launch(tmp_path, fake_tool, binary, ["--warm"])
+    assert calls == [BUILD, WARM_ARCHIVES.replace("victory ", "reported ", 1) + default_env(),
+                     GAME.replace("victory ", "reported ", 1) + default_env()], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_build_requires_exactly_one_victory_artifact(tmp_path, fake_tool, binary, monkeypatch, count):
+    monkeypatch.setenv("FAKE_CARGO_ARTIFACT_COUNT", str(count))
+    done, calls = launch(tmp_path, fake_tool, binary)
+    assert calls == [BUILD] and done.returncode == 1
+    assert f"cargo build reported {count} VIctory executables" in done.stderr
 
 
 def test_a_missing_game_stops_before_building(tmp_path, fake_tool, binary):

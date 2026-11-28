@@ -172,8 +172,10 @@ pub enum BvhNodes {
     Resource,
     /// Title memory by address: the code makes the descriptor from numbers
     /// (the title: the whole address space, or one structure's address in
-    /// dword 0). Dwords 1 and 3, which hold its flags.
-    Memory { word1: u32, word3: u32 },
+    /// dwords 0-1). `box_sort` is bit 31 of dword 1 when statically known, or
+    /// `None` when dword 1 is computed dynamically and bit 31 must be tested
+    /// at runtime. `word3` holds the constant flags and descriptor type.
+    Memory { box_sort: Option<bool>, word3: u32 },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -272,10 +274,16 @@ pub fn track(
                         _ => None,
                     };
                     match (word(1), word(3)) {
-                        (Some(Term::Const(word1)), Some(Term::Const(word3)))
+                        (Some(w1), Some(Term::Const(word3)))
                             if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
                         {
-                            out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                            out.bvh.push((
+                                site,
+                                BvhNodes::Memory {
+                                    box_sort: t.box_sort_flag(w1),
+                                    word3,
+                                },
+                            ));
                         }
                         _ => {
                             descriptor(rsrc, Role::Resource)?;
@@ -567,6 +575,36 @@ impl<'a> Tracer<'a> {
         self.origin[v.0 as usize]
     }
 
+    /// Whether `BOX_SORT` (bit 31 of BVH descriptor dword 1) is statically
+    /// known for `term`, or `None` when it must be tested dynamically at
+    /// runtime.
+    fn box_sort_flag(&self, term: Term) -> Option<bool> {
+        let bit = crate::bvh::BOX_SORT;
+        match term {
+            Term::Const(w) => Some(w & bit != 0),
+            Term::Value(v) => {
+                if let Some((_, [a, b])) = self.sop2(v, &["s_or_b32"])
+                    && (matches!(a, Term::Const(c) if c & bit != 0)
+                        || matches!(b, Term::Const(c) if c & bit != 0))
+                {
+                    return Some(true);
+                }
+                if let Some((_, [a, b])) = self.sop2(v, &["s_and_b32"])
+                    && (matches!(a, Term::Const(c) if c & bit == 0)
+                        || matches!(b, Term::Const(c) if c & bit == 0))
+                {
+                    return Some(false);
+                }
+                if let Some((_, [_, Term::Const(shift)])) = self.sop2(v, &["s_lshr_b32"])
+                    && (shift & 31) > 0
+                {
+                    return Some(false);
+                }
+                None
+            }
+        }
+    }
+
     /// The origin of a one-dword operand as `inst` reads it.
     fn term(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
@@ -660,7 +698,7 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -706,7 +744,7 @@ impl<'a> Tracer<'a> {
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
-            .or_else(|| self.vadd(v))
+            .or_else(|| self.vadd(v, false))
         else {
             return dynamic;
         };
@@ -737,7 +775,7 @@ impl<'a> Tracer<'a> {
             if x == v {
                 continue;
             }
-            let pc = self.code_base(x, 4)?;
+            let pc = self.code_base(x, 4, false)?;
             base = base.or(Some(pc));
         }
         base
@@ -766,14 +804,15 @@ impl<'a> Tracer<'a> {
 
     /// The `s_getpc_b64` low dword among the terms `v` adds up (`depth`
     /// additions deep; joins are not followed).
-    fn code_base(&self, v: Value, depth: u32) -> Option<Value> {
+    /// Include clamped terms only to identify a code base for a diagnostic.
+    fn code_base(&self, v: Value, depth: u32, trace_through_clamp: bool) -> Option<Value> {
         if self.getpc(v).is_some() {
             return Some(v);
         }
         // Computed in VGPRs and taken from the first lane.
         if let Some(lane) = self.first_lane(v) {
             return match self.vorigin(lane) {
-                Term::Value(x) => self.code_base(x, depth),
+                Term::Value(x) => self.code_base(x, depth, trace_through_clamp),
                 Term::Const(_) => None,
             };
         }
@@ -783,9 +822,9 @@ impl<'a> Tracer<'a> {
         let terms = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
-            .or_else(|| self.vadd(v))?;
+            .or_else(|| self.vadd(v, trace_through_clamp))?;
         terms.into_iter().find_map(|t| match t {
-            Term::Value(x) => self.code_base(x, depth - 1),
+            Term::Value(x) => self.code_base(x, depth - 1, trace_through_clamp),
             Term::Const(_) => None,
         })
     }
@@ -830,7 +869,7 @@ impl<'a> Tracer<'a> {
 
     /// The operands of a VALU addition (`v_add_co_u32`, `v_add_nc_u32`)
     /// writing `v`, through VGPR copies of scalars.
-    fn vadd(&self, v: Value) -> Option<[Term; 2]> {
+    fn vadd(&self, v: Value, trace_through_clamp: bool) -> Option<[Term; 2]> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
@@ -843,6 +882,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || (f.clamp && !trace_through_clamp)
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -951,10 +991,10 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
+        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
@@ -1067,13 +1107,17 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
-        if self.inputs[v.0 as usize].is_some() {
-            return "an address in an SGPR that is no root parameter";
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            return if self.param_of(reg).is_some() {
+                "an address from a root parameter that is no address"
+            } else {
+                "an address in an SGPR that is no root parameter"
+            };
         }
-        if self
-            .leaves(v)
-            .any(|l| self.def(l).is_some_and(|i| i.name() == "s_getpc_b64"))
-        {
+        if self.leaves(v).any(|l| {
+            self.def(l).is_some_and(|i| i.name() == "s_getpc_b64")
+                || self.code_base(l, 4, true).is_some()
+        }) {
             return "an address relative to the program counter";
         }
         match self.def(v).map(|i| i.name()) {
@@ -2832,28 +2876,46 @@ pub(crate) mod tests {
     /// through and the lane's index is the computed term. (A first-lane read
     /// of an index alone stays the computed term itself; see
     /// `the_console_waterfall_over_a_first_lane_offset_is_one`.)
+    fn first_lane_code_table_load(clamp: bool) -> Result<Resources, ShaderError> {
+        let words = [
+            0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+            0xD70F_0457 | (u32::from(clamp) << 15),
+            0x0000_054A, // v_add_co_u32 v87, s4, v74, s2
+            0xD528_0458,
+            0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+            0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+            0x7E0E_0558, // v_readfirstlane_b32 s7, v88
+            0xF400_0203,
+            0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, &[], HwStage::Cs, lanes(&p).as_ref())
+    }
+
     #[test]
     fn a_code_table_address_taken_from_the_first_lane() {
-        let r = track_words(
-            &[
-                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
-                0xD70F_0457,
-                0x0000_054A, // v_add_co_u32 v87, s4, v74, s2
-                0xD528_0458,
-                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
-                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
-                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
-                0xF400_0203,
-                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
-                S_ENDPGM,
-            ],
-            &[],
-            HwStage::Cs,
-        );
+        let r = first_lane_code_table_load(false).unwrap();
         assert_eq!(r.scalar.len(), 1);
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 4));
         assert!(a.dynamic.is_some(), "the lane's index is the computed term");
+    }
+
+    #[test]
+    fn clamped_u32_add_does_not_trace_a_code_table_address() {
+        let err = first_lane_code_table_load(true).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "an address relative to the program counter",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -4154,5 +4216,246 @@ pub(crate) mod tests {
             "guarded join should resolve the immediate sampler from the live arm: {:?}",
             r.descriptors
         );
+    }
+
+    #[test]
+    fn root_constant_zero_offsets_tables_and_root_descriptors() {
+        // RootType::Constants dword 0 (s0) as an SMEM soffset and via s_add_u32
+        // on a descriptor table base (s2).
+        let r = track_words(
+            &[
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0x0000_0020, // s_load_dwordx4 s[8:11], s[4:5], s0 offset:0x20
+                0x8006_0002, // s_add_u32 s6, s2, s0
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0303,
+                0xFA00_0040, // s_load_dwordx4 s[12:15], s[6:7], 0x40
+                0xE030_1000,
+                0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen
+                0xE070_1000,
+                0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let c0 = r.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(
+            r.scalar,
+            [
+                (
+                    (0, 2),
+                    Address {
+                        param: 1,
+                        offset: 0x20,
+                        dynamic: Some(c0),
+                    },
+                ),
+                (
+                    (0, 5),
+                    Address {
+                        param: 1,
+                        offset: 0x40,
+                        dynamic: Some(c0),
+                    },
+                ),
+            ]
+        );
+        assert_eq!(r.descriptors.len(), 2);
+
+        // RootType::Constants dword 0 spilled through a VGPR lane and used as a
+        // table soffset.
+        let spilled = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0600, // v_writelane_b32 v0, s0, 3
+                0xD760_0004,
+                0x0001_0700, // v_readlane_b32 s4, v0, 3
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0203,
+                0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Table, 6, 1)],
+            HwStage::Cs,
+        );
+        let sc0 = spilled
+            .params
+            .iter()
+            .find(|p| (p.1, p.2) == (0, 0))
+            .unwrap()
+            .0;
+        assert_eq!(
+            spilled.scalar,
+            [(
+                (0, 3),
+                Address {
+                    param: 1,
+                    offset: 0,
+                    dynamic: Some(sc0),
+                },
+            )]
+        );
+
+        // RootType::Constants dword 0 as byte offset on RootType::Descriptor
+        // (s_load_dword and global_load_dword), while (dword 0, dword 1) as a
+        // 64-bit pointer still classifies as MEMORY.
+        let desc = track_words(
+            &[
+                0xF400_0101,
+                0x0000_0008, // s_load_dword s4, s[2:3], s0 offset:0x8
+                0x7E02_0200, // v_mov_b32 v1, s0
+                0xDC30_800C,
+                0x0202_0001, // global_load_dword v2, v1, s[2:3] offset:12
+                0x4A06_0290, // v_add_nc_u32 v3, 16, v1
+                0xDC30_8004,
+                0x0402_0003, // global_load_dword v4, v3, s[2:3] offset:4
+                0xF400_0180,
+                0xFA00_0000, // s_load_dword s6, s[0:1], null
+                0xDC30_8000,
+                0x0500_0000, // global_load_dword v5, v0, s[0:1]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        let dc0 = desc.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(
+            desc.scalar,
+            [
+                (
+                    (0, 0),
+                    Address {
+                        param: 1,
+                        offset: 8,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                (
+                    (0, 2),
+                    Address {
+                        param: 1,
+                        offset: 12,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                (
+                    (0, 4),
+                    Address {
+                        param: 1,
+                        offset: 20,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                ((0, 5), at(MEMORY, 0)),
+                ((0, 6), at(MEMORY, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_constant_zero_offsets_emit_to_dxil() {
+        use crate::native::{ComputeIo, NativeProgram, ResourceType, StageIo, UsedResource};
+
+        let words: &[u32] = &[
+            0xBE86_0302, // s_mov_b32 s6, s2
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0x0000_0000, // s_load_dwordx4 s[8:11], s[6:7], s0
+            0x800C_0002, // s_add_u32 s12, s2, s0
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0306,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[12:13], 0x20
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xDC30_8008,
+            0x0204_0001, // global_load_dword v2, v1, s[4:5] offset:8
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xE030_1000,
+            0x8002_0300, // buffer_load_dword v3, v0, s[8:11], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0702, // v_add_nc_u32 v2, v2, v3
+            0xE070_1000,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    slot: 0,
+                    ..param(Constants, 0, 2)
+                },
+                RootParam {
+                    slot: 1,
+                    ..param(Table, 2, 1)
+                },
+                RootParam {
+                    slot: 2,
+                    ..param(Descriptor, 4, 2)
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 2,
+                    user_data: 4,
+                    slot: 2,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 6 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        assert!(!res.scalar.iter().any(|(_, a)| a.param == MEMORY));
+        let io = crate::io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let empty = crate::Container::parse(&bytes).unwrap();
+        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        assert!(shader.user_data.contains(&crate::emit::UserData {
+            index: 0,
+            slot: 0,
+            root: Constants,
+            dword: 0,
+        }));
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
     }
 }

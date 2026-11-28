@@ -218,7 +218,7 @@ if ($Warm) {
     $prevErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $exe warm @archives
+        & $exe warm
     } finally {
         $ErrorActionPreference = $prevErrorAction
     }
@@ -237,7 +237,7 @@ if ($Precompile) {
     $prevErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $exe warm $shaders $gameExe @dlls
+        & $exe warm
     } finally {
         $ErrorActionPreference = $prevErrorAction
     }

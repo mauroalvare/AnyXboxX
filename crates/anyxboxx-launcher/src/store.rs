@@ -1,4 +1,4 @@
-//! The settings file: `%LOCALAPPDATA%\AnyXboxX\launcher\settings.toml`. It keeps the game folder,
+//! The settings file: `%LOCALAPPDATA%\AnyXboxX\launcher\settings.toml`. It keeps the game folder, the AnyXboxX folder,
 //! the XG library, the thread count and the Play page's options between runs. A missing or broken
 //! file is not an error: the launcher starts with its defaults.
 
@@ -16,6 +16,7 @@ use crate::session::Settings;
 #[serde(default)]
 pub struct Stored {
     pub game_dir: String,
+    pub repo_dir: String,
     pub xg_dll: String,
     /// `real` or `compare`.
     pub xg_mode: String,
@@ -31,6 +32,7 @@ impl Stored {
     pub fn from_settings(settings: &Settings) -> Self {
         Stored {
             game_dir: settings.game_dir.clone(),
+            repo_dir: settings.repo_dir.clone(),
             xg_dll: settings.xg_dll.clone(),
             xg_mode: settings.xg_mode.as_str().to_string(),
             jobs: settings.jobs,
@@ -45,6 +47,7 @@ impl Stored {
     pub fn into_settings(self) -> Settings {
         Settings {
             game_dir: self.game_dir,
+            repo_dir: self.repo_dir,
             xg_dll: self.xg_dll,
             xg_mode: if self.xg_mode == "compare" {
                 XgMode::Compare
@@ -98,6 +101,7 @@ mod tests {
     fn sample() -> Settings {
         Settings {
             game_dir: "D:\\Game".to_string(),
+            repo_dir: "D:\\AnyXboxX".to_string(),
             xg_dll: "D:\\xg_xs.dll".to_string(),
             xg_mode: XgMode::Compare,
             jobs: 6,
@@ -105,6 +109,14 @@ mod tests {
             keep_open_after_launch: true,
             always_rewarm: true,
             options: LaunchOptions {
+                dlss: crate::dlss::DlssOptions {
+                    super_resolution: true,
+                    framegen: true,
+                    mode: "balanced".into(),
+                    preset: "k".into(),
+                    hudless: false,
+                    streamline_dir: r"D:\Streamline SDK\bin\x64".into(),
+                },
                 preset: Preset::Quality,
                 resolution: Resolution::P1080,
                 window: WindowMode::Borderless,
@@ -126,9 +138,31 @@ mod tests {
         assert_eq!(back, stored);
         let settings = back.into_settings();
         assert_eq!(settings.game_dir, "D:\\Game");
+        assert_eq!(settings.repo_dir, "D:\\AnyXboxX");
         assert_eq!(settings.xg_mode, XgMode::Compare);
         assert_eq!(settings.options.keyboard, Keyboard::Azerty);
         assert!(settings.options.warm_first);
+    }
+
+    #[test]
+    fn the_anyxboxx_folder_is_kept_and_an_old_file_without_it_still_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("settings.toml");
+        let chosen = Settings {
+            repo_dir: "E:\\Clones\\AnyXboxX".to_string(),
+            ..Settings::default()
+        };
+        save(&path, &Stored::from_settings(&chosen)).expect("save");
+        let back = load(&path).expect("load").into_settings();
+        assert_eq!(back.repo_dir, "E:\\Clones\\AnyXboxX");
+        assert_eq!(
+            back.repo_path(),
+            Some(PathBuf::from("E:\\Clones\\AnyXboxX"))
+        );
+        std::fs::write(&path, "game_dir = \"E:\\\\G\"\n").expect("write");
+        let old = load(&path).expect("load").into_settings();
+        assert_eq!(old.repo_dir, "");
+        assert_eq!(old.repo_path(), None);
     }
 
     #[test]
@@ -152,6 +186,7 @@ mod tests {
         let settings = load(&path).expect("load").into_settings();
         assert_eq!(settings.game_dir, "E:\\G");
         assert_eq!(settings.options.keyboard, Keyboard::Qwertz);
+        assert_eq!(settings.options.dlss, crate::dlss::DlssOptions::default());
         assert_eq!(settings.options.preset, Preset::Fast);
         assert_eq!(settings.xg_mode, XgMode::Real);
     }

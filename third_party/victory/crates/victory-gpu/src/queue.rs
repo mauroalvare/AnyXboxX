@@ -442,6 +442,13 @@ pub(crate) fn before_sync() {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn wait_before_framegen() {
+    if behind::on() {
+        behind::wait_before_framegen();
+    }
+}
+
 /// Whether submissions go into the line of a thread of ours ([`behind`]).
 #[cfg(windows)]
 pub(crate) fn line_on() -> bool {
@@ -466,12 +473,29 @@ pub(crate) fn queued() -> u64 {
     behind::queued()
 }
 
+/// Exclusive entry-number watermark if any async-submit entry is currently
+/// queued or executing in [`behind`], or `None` when idle.
+#[cfg(windows)]
+pub(crate) fn pending_mark() -> Option<u64> {
+    behind::pending_mark()
+}
+
+/// Whether every async-submit entry before `limit` has finished reaching
+/// `host::submit`.
+#[cfg(windows)]
+pub(crate) fn passed_mark(limit: u64) -> bool {
+    behind::passed_mark(limit)
+}
+
 /// For the frame-rate line.
 #[cfg(windows)]
 pub(crate) fn behind_line(frames: f64) {
     if behind::on() {
         crate::list::thin::line(frames);
         behind::line(frames);
+    } else {
+        crate::overlay::set_pool_off(crate::overlay::Pool::Submit);
+        crate::overlay::set_pool_off(crate::overlay::Pool::Thin);
     }
 }
 
@@ -566,6 +590,12 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    execute_with_token(this, count, lists, None);
+}
+
+fn execute_with_token(this: This, count: u32, lists: *const This, token: Option<u64>) {
+    #[cfg(not(windows))]
+    let _ = token;
     if lists.is_null() {
         return;
     }
@@ -576,7 +606,16 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if let Some(token) = token && crate::framegen::requested() {
+            crate::framegen::bind_submission(lists, token);
+        }
         if behind::on() && !this.is_null() {
+            if !lists.is_empty() {
+                crate::streamline::latency::mark(
+                    || token.filter(|&t| t != 0).unwrap_or_else(crate::frame::current),
+                    crate::streamline::latency::Phase::RenderSubmit,
+                );
+            }
             behind::submit(this, lists);
             return;
         }
@@ -688,9 +727,9 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
     crate::resource::is_resource(resource).then_some(resource)
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
-/// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+/// token, flags)`. Frame generation uses the token to match the next present.
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
+    execute_with_token(this, count, lists, Some(token));
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
@@ -883,7 +922,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -925,7 +964,24 @@ extern "system" fn present(
     if !behind::on() {
         release_held(forces());
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let drained_for_trace = {
+        let next = presented() + 1;
+        if crate::capture::trace_boundary(next) {
+            before_sync();
+            Some(next)
+        } else {
+            None
+        }
+    };
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    let token = if planes > 0 {
+        // SAFETY: a positive plane count supplies the first plane.
+        unsafe { plane_parameters.as_ref() }.map(|plane| plane.token)
+    } else {
+        None
+    };
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -958,24 +1014,21 @@ extern "system" fn present(
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
-            before_sync();
+            if drained_for_trace != Some(frame) {
+                before_sync();
+            }
             crate::capture::dump_targets(frame);
         }
     }
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let base_res = if planes > 0
-            // SAFETY: the title passes `planes` plane descriptions.
-            && let Some(plane) = unsafe { plane_parameters.as_ref() }
-            && plane.count > 0
-            && !plane.resources.is_null()
-        {
+        // SAFETY: the title passes a first plane when the count is nonzero.
+        let base = (planes > 0).then(|| unsafe { plane_parameters.as_ref() }).flatten();
+        let base_res = base.filter(|plane| plane.count > 0 && !plane.resources.is_null()).map(|plane| {
             // SAFETY: the plane lists `count` resources.
-            Some(unsafe { *plane.resources })
-        } else {
-            None
-        };
+            unsafe { *plane.resources }
+        });
         let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
@@ -997,7 +1050,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, token },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1033,7 +1086,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, token },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1079,6 +1132,9 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    /// Frame-origin token supplied by PresentX. The capture ordinal above
+    /// may differ after a skipped origin or an extra present.
+    token: Option<u64>,
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1092,7 +1148,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes(texture, state, overlay, what.frame, what.token);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

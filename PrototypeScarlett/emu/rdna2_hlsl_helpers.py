@@ -141,15 +141,17 @@ uint MulLegacyF32(uint a, uint b) {
 uint RndneF32(uint a) {
   // Arrondi au pair en entier : le pilote NVIDIA 621.xx (RTX 4060, RTX 5070 Ti, #227) replie
   // Round_ne(2.5) en 3.0 après une barrière ; en entier le résultat suit IEEE 754 (signe de ±0, NaN).
+  // Une seule sortie : avec des sorties anticipées, le pilote AMD de la RX 9070 XT compile mal un
+  // v_bfrev_b32 voisin (bit 30 en trop, #160). Les cas sont calculés puis choisis à la fin.
   uint sign_bit = a & 0x80000000u, mag = a & 0x7FFFFFFFu;
-  if (mag >= 0x4B000000u) return mag > 0x7F800000u ? (a | 0x400000u) : a;
-  if (mag <= 0x3F000000u) return sign_bit;
-  if (mag < 0x3F800000u) return sign_bit | 0x3F800000u;
-  uint shift = 150u - (mag >> 23);
+  uint shift = (mag >= 0x3F800000u && mag < 0x4B000000u) ? 150u - (mag >> 23) : 1u;
   uint mask = (1u << shift) - 1u, half_bit = 1u << (shift - 1u);
   uint rem = mag & mask, rounded = mag & ~mask;
-  if (rem > half_bit || (rem == half_bit && (rounded & (1u << shift)) != 0u)) rounded += 1u << shift;
-  return sign_bit | rounded;
+  bool up = rem > half_bit || (rem == half_bit && (rounded & (1u << shift)) != 0u);
+  uint mid = sign_bit | (rounded + (up ? (1u << shift) : 0u));
+  uint big = mag > 0x7F800000u ? (a | 0x400000u) : a;
+  uint small = mag < 0x3F800000u ? (mag <= 0x3F000000u ? sign_bit : (sign_bit | 0x3F800000u)) : mid;
+  return mag >= 0x4B000000u ? big : small;
 }
 uint PermB32(uint a, uint b, uint c) {
   uint r = 0u;

@@ -13,14 +13,21 @@ pub fn decode_surface(blocks: &[u8], width: usize, height: usize) -> Result<Vec<
     const SIDE: usize = 4;
     const PIXEL_BYTES: usize = 4;
     let (columns, rows) = (width.div_ceil(SIDE), height.div_ceil(SIDE));
-    if blocks.len() != columns * rows * bc7::BLOCK_BYTES {
+    let expected = columns
+        .checked_mul(rows)
+        .and_then(|n| n.checked_mul(bc7::BLOCK_BYTES))
+        .ok_or_else(|| format!("dimensions trop grandes pour {width}×{height}"))?;
+    if blocks.len() != expected {
         return Err(format!(
-            "{} octets reçus, {} attendus pour {width}×{height}",
-            blocks.len(),
-            columns * rows * bc7::BLOCK_BYTES
+            "{} octets reçus, {expected} attendus pour {width}×{height}",
+            blocks.len()
         ));
     }
-    let mut image = vec![0u8; width * height * PIXEL_BYTES];
+    let image_bytes = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(PIXEL_BYTES))
+        .ok_or_else(|| format!("dimensions trop grandes pour {width}×{height}"))?;
+    let mut image = vec![0u8; image_bytes];
     if blocks.is_empty() {
         return Ok(image);
     }
@@ -44,4 +51,15 @@ pub fn decode_surface(blocks: &[u8], width: usize, height: usize) -> Result<Vec<
         }
     }
     Ok(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_surface_rejects_overflowing_dimensions() {
+        assert!(decode_surface(&[], usize::MAX, 4).is_err());
+        assert!(decode_surface(&[], 1 << 32, 1 << 32).is_err());
+    }
 }

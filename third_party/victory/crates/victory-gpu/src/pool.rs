@@ -64,8 +64,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_for(memory, keep, crate::resource::room_percent().saturating_sub(5))
+}
+
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, target_pct: u64) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * u128::from(target_pct) => SPARE_KEPT,
         _ => SPARE,
     }
 }
@@ -648,6 +652,7 @@ pub(crate) unsafe fn texture(
     device: &ID3D12Device,
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
+    first_attempt: bool,
 ) -> Option<ID3D12Resource> {
     if !on() {
         return None;
@@ -678,7 +683,11 @@ pub(crate) unsafe fn texture(
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
+            // The pool still backs off its own growth when this is the
+            // texture's last attempt, without renewing the global pause.
+            if first_attempt {
+                crate::residency::allocation_error(&e);
+            }
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
@@ -911,7 +920,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) }) else { return };
+        let Some(t) = (unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) }) else { return };
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();
@@ -932,5 +941,15 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn spares_scales_with_room_target() {
+        let gib = 1 << 30;
+        assert_eq!(spares_for(Some([100 * gib, 84 * gib, 0, 0]), true, 85), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100 * gib, 85 * gib, 0, 0]), true, 85), SPARE);
+        assert_eq!(spares_for(Some([100 * gib, 74 * gib, 0, 0]), true, 75), SPARE_KEPT);
+        assert_eq!(spares_for(Some([100 * gib, 75 * gib, 0, 0]), true, 75), SPARE);
+        assert_eq!(spares_for(Some([100 * gib, 10 * gib, 0, 0]), false, 85), SPARE);
     }
 }

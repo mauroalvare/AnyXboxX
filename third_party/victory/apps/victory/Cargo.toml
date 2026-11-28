@@ -22,6 +22,9 @@ clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
@@ -34,6 +37,7 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

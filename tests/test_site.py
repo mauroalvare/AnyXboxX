@@ -17,6 +17,13 @@ def test_site_links_to_the_launcher_guide_and_the_measured_figures():
     assert "16–17" in html and "13.4 fps" in html
 
 
+def test_site_identifies_the_documented_neptune_runs():
+    html = SITE.read_text(encoding="utf-8")
+    assert "25 November measured 13.8 fps median" in html
+    assert "20-minute Neptune run" in html and "ocean readback enabled" in html
+    assert "docs/running-gta6.md#run" in html and "#on-linux-proton-amd" in html
+
+
 def test_site_has_no_leftover_estimator_script():
     assert not (RACINE / "site" / "estimate.js").exists()
     assert 'src="app.js"' not in SITE.read_text(encoding="utf-8")

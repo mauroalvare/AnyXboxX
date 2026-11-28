@@ -61,14 +61,20 @@ fn refused(message: String) -> Error {
     Error::Untranslated(message)
 }
 
-/// An index that must stay within `last`; a 64-bit one must be even.
-fn check(name: &str, index: u32, last: u32, width: u32) -> Result<u32, Error> {
-    if index + width - 1 > last || (width == 2 && index % 2 == 1) {
+/// The register `register + offset`, which must stay within `last`; a 64-bit one must be even.
+///
+/// The sum is taken in 64 bits, like the Python's unbounded integers: M0 is a full 32-bit value, so an
+/// offset such as 0xFFFF_FFFD added to register 47 is 0x1_0000_002C, outside the model, and not register
+/// 44 as a wrapping 32-bit sum would make it (nor a panic, in a build that checks overflow).
+fn check(name: &str, register: u32, offset: u32, last: u32, width: u32) -> Result<u32, Error> {
+    let index = u64::from(register) + u64::from(offset);
+    if index + u64::from(width) - 1 > u64::from(last) || (width == 2 && index % 2 == 1) {
         return Err(refused(format!(
             "{name} : registre indexé {index} hors du modèle"
         )));
     }
-    Ok(index)
+    // In range: at most `last`, which is a u32.
+    Ok(index as u32)
 }
 
 /// A vector instruction of the VOP1 or VOP3 encodings, for every active lane.
@@ -83,7 +89,7 @@ pub fn vector(
         return Ok(false);
     }
     let (source_offset, destination_offset) = offsets(name, wave.s[M0 as usize]);
-    let destination = check(name, vdst + destination_offset, VGPR_LAST, 1)? as usize;
+    let destination = check(name, vdst, destination_offset, VGPR_LAST, 1)? as usize;
     if name == "v_movreld_b32" {
         for lane in wave.active()? {
             wave.v[destination][lane] = wave.read_lane(src0, lane, literal)?;
@@ -95,7 +101,7 @@ pub fn vector(
             "{name} : la source indexée doit être un VGPR"
         )));
     }
-    let source = check(name, src0 - VGPR_FIRST + source_offset, VGPR_LAST, 1)? as usize;
+    let source = check(name, src0 - VGPR_FIRST, source_offset, VGPR_LAST, 1)? as usize;
     let swap = matches!(name, "v_swap_b32" | "v_swaprel_b32");
     for lane in wave.active()? {
         let value = wave.v[source][lane];
@@ -131,7 +137,7 @@ pub fn scalar(
                 "{name} : la source indexée doit être un SGPR"
             )));
         }
-        let index = check(name, ssrc0 + source_offset, LAST_SGPR, width)? as usize;
+        let index = check(name, ssrc0, source_offset, LAST_SGPR, width)? as usize;
         let low = u64::from(wave.s[index]);
         if width == 2 {
             low | u64::from(wave.s[index + 1]) << 32
@@ -148,7 +154,7 @@ pub fn scalar(
             "{name} : la destination indexée doit être un SGPR"
         )));
     }
-    let target = check(name, sdst + destination_offset, LAST_SGPR, width)? as usize;
+    let target = check(name, sdst, destination_offset, LAST_SGPR, width)? as usize;
     wave.s[target] = (value & MASK32) as u32;
     if width == 2 {
         wave.s[target + 1] = ((value >> 32) & MASK32) as u32;
@@ -169,7 +175,20 @@ mod tests {
 
     #[test]
     fn an_odd_64_bit_index_is_refused() {
-        assert!(check("s_movrels_b64", 3, 105, 2).is_err());
-        assert_eq!(check("s_movrels_b64", 4, 105, 2).unwrap(), 4);
+        assert!(check("s_movrels_b64", 3, 0, 105, 2).is_err());
+        assert_eq!(check("s_movrels_b64", 4, 0, 105, 2).unwrap(), 4);
+        assert_eq!(check("s_movrels_b64", 1, 3, 105, 2).unwrap(), 4);
+    }
+
+    #[test]
+    fn an_index_past_32_bits_is_refused_not_wrapped() {
+        // 47 + 0xFFFF_FFFD is 0x1_0000_002C; a wrapping sum would give register 44.
+        assert!(check("s_movrels_b32", 47, 0xFFFF_FFFD, 105, 1).is_err());
+        assert!(check("v_movreld_b32", 3, 0xFFFF_FFFF, 255, 1).is_err());
+        // The pair's second register is counted in 64 bits too.
+        assert!(check("s_movrels_b64", 1, 0xFFFF_FFFF, 105, 2).is_err());
+        assert!(check("s_movrels_b64", 0, 0xFFFF_FFFF, 105, 2).is_err());
+        assert_eq!(check("s_movrels_b32", 105, 0, 105, 1).unwrap(), 105);
+        assert!(check("s_movrels_b32", 105, 1, 105, 1).is_err());
     }
 }

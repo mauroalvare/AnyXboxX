@@ -40,6 +40,18 @@ pub enum LoadError {
     NotPe32Plus,
     #[error("incompatible PE image or missing entry point")]
     BadHeaders,
+    #[error("PE section table or declared headers exceed the file header range")]
+    HeaderRange,
+    #[error("unsupported PE section count {0}")]
+    SectionCount(usize),
+    #[error("incompatible PE file or section alignment")]
+    Alignment,
+    #[error("PE data directory {0} is outside its valid range")]
+    DirectoryRange(usize),
+    #[error("PE section at RVA {0:#x} has an invalid raw range")]
+    RawSection(u64),
+    #[error("could not reserve {0} bytes for PE mapping data")]
+    Allocation(usize),
     #[error("feature not emulated: {0}")]
     Unsupported(&'static str),
     #[error("malformed image: {0}")]
@@ -120,19 +132,20 @@ where
     }
     let headers = Headers::read(data)?;
     check(&headers)?;
+    let layout = mapping::ImageLayout::check(data, &headers)?;
+    let relocations = layout.relocations()?;
     let info = ImageInfo::parse(data)?;
-    let mut mapped = mapping::map(data, &headers)?;
-    let relocations = mapping::relocations(&mapped, &headers)?;
-    let size = align(u64::from(headers.size_of_image));
+    let mut mapped = layout.map()?;
+    let size = layout.size() as u64;
     let base = allocate(
         usable(headers.image_base, size),
         size,
-        !relocations.is_empty(),
+        relocations.has_entries(),
     )?;
     let delta = base.wrapping_sub(headers.image_base);
     let imports = imports(&info, base, size)?;
     let tls_fields = tls::fields(&mapped, &headers, delta)?;
-    mapping::relocate(&mut mapped, &relocations, delta)?;
+    relocations.apply(&mut mapped, delta)?;
     let (exports, ordinals, forwarders) = exports(&info, base);
     Ok(Image {
         base,
@@ -156,17 +169,14 @@ where
 
 /// Protection of each page of the image (`PROT_*` bits), as `loader._map` sets them.
 pub fn page_protections(data: &[u8]) -> Result<Vec<u8>, LoadError> {
-    mapping::page_protections(&Headers::read(data)?)
+    mapping::ImageLayout::check(data, &Headers::read(data)?)?.page_protections()
 }
 
 fn check(headers: &Headers) -> Result<(), LoadError> {
     let size = headers.size_of_image;
     let entry = headers.entry_rva;
     let entry_ok = entry < size && (headers.is_dll() || entry > 0);
-    let sizes_ok = 0 < headers.size_of_headers
-        && headers.size_of_headers <= size
-        && u64::from(size) <= MAX_IMAGE;
-    if !sizes_ok || !entry_ok {
+    if !entry_ok {
         return Err(LoadError::BadHeaders);
     }
     if headers.has_directory(DIR_IMPORT_DELAY) {

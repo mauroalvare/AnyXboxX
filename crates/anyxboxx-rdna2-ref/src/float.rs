@@ -73,6 +73,32 @@ pub fn py_max(a: f64, b: f64) -> f64 {
     if b > a { b } else { a }
 }
 
+/// `a × b + c` of the model's `_mul_add` (`v_mad_f32`, `v_mac_f32`, `v_madmk_f32`, `v_madak_f32`): the
+/// product, then the sum, in double precision, rounded to single precision afterwards by `float_bits`.
+///
+/// The NaN it returns is the one the model's x86-64 arithmetic gives for `a * b + c`: the first NaN
+/// operand of the product (`a`, then `b`), or the NaN the product makes (∞ × 0); only then a NaN `c`.
+/// That order is written out because a plain `a * b + c` leaves it to the compiler, which may swap the
+/// operands of the addition: it did, and the addend's NaN came out where the model keeps the product's.
+/// Without a NaN operand the expression is computed as it is (∞ − ∞ gives the processor's NaN, as in
+/// the model).
+pub fn mul_add(a: f64, b: f64, c: f64) -> f64 {
+    let product = if a.is_nan() {
+        a
+    } else if b.is_nan() {
+        b
+    } else {
+        a * b
+    };
+    if product.is_nan() {
+        return product;
+    }
+    if c.is_nan() {
+        return c;
+    }
+    product + c
+}
+
 /// `math.frexp`: `x = m * 2^e` with 0.5 <= |m| < 1 (zero, infinities and NaN return `(x, 0)`).
 pub fn frexp(x: f64) -> (f64, i32) {
     if x == 0.0 || !x.is_finite() {
@@ -192,6 +218,22 @@ mod tests {
         assert!(py_min(f64::NAN, 1.0).is_nan());
         assert_eq!(py_min(1.0, f64::NAN), 1.0);
         assert_eq!(py_max(2.0, 3.0), 3.0);
+    }
+
+    #[test]
+    fn mul_add_keeps_the_nan_of_the_product_before_the_addend() {
+        let (a, b, c) = (
+            f64::from_bits(0x7FF8_0000_0000_0A0A),
+            f64::from_bits(0x7FF8_0000_0000_0B0B),
+            f64::from_bits(0x7FF8_0000_0000_0C0C),
+        );
+        assert_eq!(mul_add(a, b, c).to_bits(), a.to_bits());
+        assert_eq!(mul_add(1.0, b, c).to_bits(), b.to_bits());
+        assert_eq!(mul_add(1.0, 2.0, c).to_bits(), c.to_bits());
+        // The NaN of ∞ × 0 comes before a NaN addend, as in `(a * b) + c`.
+        let generated = mul_add(f64::INFINITY, 0.0, c);
+        assert!(generated.is_nan() && generated.to_bits() != c.to_bits());
+        assert_eq!(mul_add(2.0, 3.0, 1.0), 7.0);
     }
 
     #[test]

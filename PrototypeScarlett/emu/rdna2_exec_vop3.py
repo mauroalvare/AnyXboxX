@@ -10,6 +10,7 @@ import math
 from emu import (rdna2_exec_cmp16, rdna2_exec_cmp64, rdna2_exec_cmpf16, rdna2_exec_div, rdna2_exec_f16,
                  rdna2_exec_int16,
                  rdna2_exec_movrel, rdna2_exec_pkf16, rdna2_exec_sad, rdna2_exec_wide)
+from emu import rdna2_exec_f16conv
 from emu.rdna2_exec_ops import (MASK32, SIXTEEN_BIT_RESULTS, VECTOR, VECTOR_COMPARE, VECTOR_NO_OPERATION,
                                 _float_op, _fma, _legacy_fma, _mul_add, bits_float, float_bits, ldexp, signed)
 
@@ -175,7 +176,8 @@ EXECUTABLE = frozenset(set(VECTOR) - {"v_readfirstlane_b32"} | set(VECTOR_COMPAR
                        | set(rdna2_exec_wide.OPERATIONS) | set(rdna2_exec_div.OPERATIONS)
                        | rdna2_exec_movrel.VECTOR | set(rdna2_exec_sad.OPERATIONS)
                        | set(rdna2_exec_f16.OPERATIONS) | set(rdna2_exec_cmpf16.COMPAREF16) | rdna2_exec_int16.VOP3
-                       | rdna2_exec_pkf16.PK_FMAC)
+                       | rdna2_exec_pkf16.PK_FMAC
+                       | set(rdna2_exec_f16conv.OPERATIONS))
 
 
 class Fields:
@@ -220,6 +222,8 @@ def execute(wave, name, opcode, word, literal):
         return None
     if name in rdna2_exec_pkf16.PK_FMAC:
         return rdna2_exec_pkf16.execute_pk_fmac_vop3(wave, name, fields, literal)
+    if name in rdna2_exec_f16conv.OPERATIONS:
+        return rdna2_exec_f16conv.execute_vop3(wave, name, fields, literal)
     if name in rdna2_exec_f16.OPERATIONS:
         return rdna2_exec_f16.execute_vop3(wave, name, fields, literal)
     if name in rdna2_exec_int16.VOP3:
@@ -261,10 +265,13 @@ def execute(wave, name, opcode, word, literal):
         from emu.rdna2_exec import Untranslated
         raise Untranslated(f"{name} en VOP3 sans littéral")
     destination = wave.v[fields.vdst]
+    # v_cndmask_b32's lane mask (S2) is read once, before the lanes: an operand the model refuses is
+    # refused whatever EXEC holds, as the checks above are (and as the Rust port does).
+    select = wave.read_mask(fields.sources[2], literal) if name == "v_cndmask_b32" else 0
     for lane in wave.active():
         a, b, c = _inputs(wave, fields, lane, literal, float_inputs(name))
         if is_vop1 or is_vop2:
-            condition = wave.read_mask(fields.sources[2], literal) >> lane & 1 if name == "v_cndmask_b32" else 0
+            condition = select >> lane & 1
             result = VECTOR[name](a, b if is_vop2 else 0, destination[lane], literal, condition)
         else:
             result = VECTOR3[name](a, b, c)

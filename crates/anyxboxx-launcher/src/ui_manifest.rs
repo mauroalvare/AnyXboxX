@@ -12,8 +12,9 @@ pub fn section(app: &mut App, ui: &mut Ui) {
     ui.label(tokens::subtitle("File manifest (optional)"));
     ui.add_space(tokens::XS);
     ui.label(tokens::muted(
-        "SHA-256 of the required files and the .rpf archives. It reads every byte (minutes for \
-             130 GB, then remembered) and is never needed to play.",
+        "Only to check that a copy of the game is intact: you do not need it to play. It reads \
+             every byte (about 20 minutes for 130 GB, then remembered) to compute the SHA-256 of \
+             the required files and the .rpf archives.",
     ));
     ui.add_space(tokens::M);
     match app.manifest.clone() {

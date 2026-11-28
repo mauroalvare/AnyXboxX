@@ -3,7 +3,7 @@
 //!
 //! This is an allowlist, not a blocklist: a file passes only if its name is
 //! on the list, it is not too big, it is text, and it does not smuggle data
-//! inside text (long hex/base64 runs).
+//! inside text (long hex/base64 runs or decimal byte arrays).
 
 use std::path::Path;
 use std::process::Command;
@@ -13,6 +13,8 @@ use anyhow::{Context, Result, bail};
 // (The translator's one file is 570 KiB of source.)
 const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+// The XMA decoder has a 272-entry decimal VLC table.
+const MAX_DECIMAL_BYTES: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -27,8 +29,12 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ];
-// The benchmark documentation still goes through every content check below.
-const ALLOWED_DOCUMENTATION: &[&str] = &["docs/.nojekyll", "docs/index.html"];
+// These text files still go through every content check below.
+const ALLOWED_TEXT_PATHS: &[&str] = &[
+    "docs/.nojekyll",
+    "docs/index.html",
+    "linux/wineserver/view-tree.patch",
+];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
@@ -151,7 +157,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
-        || ALLOWED_DOCUMENTATION.contains(&path)
+        || ALLOWED_TEXT_PATHS.contains(&path)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -182,6 +188,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
                 "{digits} hex digits in one run of \\x/0x literals (embedded data?)"
             ));
         }
+        let decimal_bytes = longest_decimal_byte_array(content);
+        if decimal_bytes > MAX_DECIMAL_BYTES {
+            problems.push(format!(
+                "{decimal_bytes} decimal bytes in one array (embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -195,7 +207,6 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 /// Most hex digits in `\xNN` escapes or `0x` literals with only commas,
 /// whitespace or backslashes between them: a byte string or `xxd -i` array,
 /// which `longest_encoded_run` sees as many 3- or 4-character runs.
-/// shortcut: decimal arrays (`[77, 90, ...]`) still pass, add a literal count if one shows up.
 fn longest_hex_literal_run(content: &[u8]) -> usize {
     let (mut i, mut run, mut longest) = (0, 0, 0);
     while i < content.len() {
@@ -224,9 +235,38 @@ fn longest_hex_literal_run(content: &[u8]) -> usize {
     longest
 }
 
+/// Recognize bracketed, comma-separated decimal bytes in source or JSON.
+fn longest_decimal_byte_array(content: &[u8]) -> usize {
+    content
+        .split(|&byte| byte == b'[')
+        .skip(1)
+        .filter_map(|tail| {
+            let close = tail.iter().position(|&byte| byte == b']')?;
+            let array = tail[..close].trim_ascii();
+            let values = array.strip_suffix(b",").unwrap_or(array);
+            let mut count = 0;
+            for value in values.split(|&byte| byte == b',') {
+                let value = value.trim_ascii();
+                let digits = value
+                    .strip_suffix(b"_u8")
+                    .or_else(|| value.strip_suffix(b"u8"))
+                    .unwrap_or(value);
+                if !digits.iter().all(u8::is_ascii_digit)
+                    || std::str::from_utf8(digits).ok()?.parse::<u8>().is_err()
+                {
+                    return None;
+                }
+                count += 1;
+            }
+            Some(count)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{MAX_DECIMAL_BYTES, MAX_FILE_SIZE, check};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
@@ -242,9 +282,9 @@ mod tests {
     }
 
     #[test]
-    fn documentation_paths_keep_the_content_checks() {
+    fn allowed_text_paths_keep_the_content_checks() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
-        for path in super::ALLOWED_DOCUMENTATION {
+        for path in super::ALLOWED_TEXT_PATHS {
             assert!(check(path, b"original documentation").is_empty());
             assert!(!check(path, b"DDS \0").is_empty());
         }
@@ -263,9 +303,16 @@ mod tests {
             !check("data.bin", b"hello").is_empty(),
             "extension not allowed"
         );
-        assert!(
-            !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
-            "too big"
+    }
+
+    #[test]
+    fn file_size_is_checked_independently_of_embedded_data() {
+        let mut content = vec![b' '; MAX_FILE_SIZE];
+        assert!(check("a.rs", &content).is_empty());
+        content.push(b' ');
+        assert_eq!(
+            check("a.rs", &content),
+            [format!("{} bytes exceeds the {MAX_FILE_SIZE}-byte limit", content.len())]
         );
     }
 
@@ -310,5 +357,23 @@ mod tests {
             table.join(",\n    ")
         );
         assert!(check("src/table.rs", src.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_a_decimal_byte_array() {
+        let values: Vec<String> = synthetic(MAX_DECIMAL_BYTES as u32 + 1)
+            .map(|byte| byte.to_string())
+            .collect();
+        let short = format!("[{}]", values[..MAX_DECIMAL_BYTES].join(", "));
+        assert!(check("table.json", short.as_bytes()).is_empty());
+
+        let data = format!("const DATA: &[u8] = &[{}u8,\n];\n", values.join("_u8, "));
+        assert_eq!(
+            check("src/data.rs", data.as_bytes()),
+            [format!("{} decimal bytes in one array (embedded data?)", values.len())]
+        );
+
+        let statement = format!("[{}]; [0, 1]", values[..MAX_DECIMAL_BYTES].join(", "));
+        assert!(check("src/table.rs", statement.as_bytes()).is_empty());
     }
 }

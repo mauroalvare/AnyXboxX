@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -56,32 +57,59 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeftOutPolicy {
+    skip_rt_resolve: bool,
+    skip_activate_rays: bool,
+}
+
+impl LeftOutPolicy {
+    fn from_values(builder: bool, rt_resolve: Option<&str>, activate_rays: Option<&str>) -> Self {
+        let skip_rt_resolve = match rt_resolve {
+            Some("0") => true,
+            Some(_) => false,
+            None => !builder,
+        };
+        let skip_activate_rays = match activate_rays {
+            Some("0") => true,
+            Some(_) => false,
+            // Enable ray activation whenever either the BVH builder or RT resolve
+            // is enabled, unless explicitly disabled with VICTORY_ACTIVATE_RAYS=0.
+            None => !(builder || !skip_rt_resolve),
+        };
+        Self {
+            skip_rt_resolve,
+            skip_activate_rays,
         }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
-    });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
     }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
+
+    fn from_env() -> Self {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+        let rt_resolve = std::env::var("VICTORY_RT_RESOLVE").ok();
+        let activate_rays = std::env::var("VICTORY_ACTIVATE_RAYS").ok();
+        Self::from_values(builder, rt_resolve.as_deref(), activate_rays.as_deref())
     }
-    None
+
+    fn check(self, is_resolve: bool, is_activate: bool) -> Option<&'static str> {
+        if self.skip_rt_resolve && is_resolve {
+            return Some("shades ray-tracing hits without BVH, left out");
+        }
+        if self.skip_activate_rays && is_activate {
+            return Some("ray activation shader without BVH, left out");
+        }
+        None
+    }
+}
+
+fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
+    static POLICY: OnceLock<LeftOutPolicy> = OnceLock::new();
+    let policy = *POLICY.get_or_init(LeftOutPolicy::from_env);
+    policy.check(
+        named(shaders, b"CS_RaytracingResolve"),
+        named(shaders, b"CS_ScreenProbes_ActivateRays"),
+    )
+    .or_else(|| super::skipped_in_list(shaders, skip_hashes)
+        .map(|_| "skipped by VICTORY_SKIP_PIPELINES"))
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -108,6 +136,14 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        Self::new_with_skip_hashes(shaders, graphics, super::skip_hashes())
+    }
+
+    fn new_with_skip_hashes(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        skip_hashes: &[String],
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -118,7 +154,7 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let left_out = left_out(&shaders, skip_hashes);
         Pending {
             screen,
             scene_input,
@@ -138,12 +174,22 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| match catch_unwind(AssertUnwindSafe(build)) {
+            Ok(pipeline) => pipeline,
+            Err(_) => {
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "host pipeline build panicked");
+                None
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -151,26 +197,61 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
-#[cfg(feature = "diagnostics")]
+/// Classifies stage combinations rejected before translation or driver creation.
+fn unsupported_stages<'a>(stages: impl Iterator<Item = &'a str>, has_graphics: bool) -> Option<&'static str> {
+    let stages: Vec<_> = stages.collect();
+    if stages.as_slice() == ["compute"] {
+        return None;
+    }
+    if stages.iter().any(|stage| !matches!(*stage, "vertex" | "pixel" | "mesh")) {
+        return Some("unsupported shader stage");
+    }
+    if !stages.iter().any(|stage| matches!(*stage, "vertex" | "mesh")) {
+        return Some("no vertex or mesh shader");
+    }
+    if !has_graphics {
+        return Some("graphics state not kept (plain description)");
+    }
+    None
+}
+
+/// Reports why a host pipeline was left out, is pending, or failed to build.
+/// Returns `None` when the host pipeline is ready.
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(reason) = p.left_out {
+        return Some(format!("intentionally omitted: {reason}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
-                .iter()
+            let rejected = unsupported_stages(p.shaders.iter().map(|s| s.stage), p.graphics.is_some());
+            if let Some(reason) = rejected.filter(|reason| *reason != "graphics state not kept (plain description)") {
+                return Some(reason.into());
+            }
+            let failed: Vec<String> = p.shaders.iter()
                 .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
+                .map(|s| format!("{} {}", s.stage, s.hash)).collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                rejected.unwrap_or("pipeline creation failed (see creation log for device, root signature or driver error)").into()
             } else {
-                failed.join(" + ")
+                format!("shader translation failed: {}", failed.join(" + "))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_classification_tests {
+    use super::unsupported_stages;
+    #[test]
+    fn distinguishes_unsupported_stages_and_missing_state() {
+        assert_eq!(unsupported_stages(["vertex", "hull"].into_iter(), true), Some("unsupported shader stage"));
+        assert_eq!(unsupported_stages(["amplification", "mesh"].into_iter(), true), Some("unsupported shader stage"));
+        assert_eq!(unsupported_stages(["pixel"].into_iter(), true), Some("no vertex or mesh shader"));
+        assert_eq!(unsupported_stages(["vertex", "pixel"].into_iter(), false), Some("graphics state not kept (plain description)"));
+        assert_eq!(unsupported_stages(["compute"].into_iter(), false), None);
+        assert_eq!(unsupported_stages(["mesh", "pixel"].into_iter(), true), None);
     }
 }
 
@@ -235,6 +316,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Queues `p` at `REQUESTED` priority on the pipeline worker pool if it is not
+/// built or queued yet, without blocking.
+pub(crate) fn enqueue_requested(p: &Arc<Pending>) {
+    if p.left_out.is_none() && p.made.get().is_none() {
+        start(p, REQUESTED);
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -498,6 +587,7 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
+        crate::overlay::set_pool_threads(crate::overlay::Pool::Pipelines, workers);
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
@@ -561,6 +651,44 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let failed = Arc::new(Pending::new(Vec::new(), None));
+        let next = Arc::new(Pending::new(Vec::new(), None));
+        let failed_job = Arc::clone(&failed);
+        let next_job = Arc::clone(&next);
+        std::thread::spawn(move || {
+            failed_job.make_with(|| panic!("synthetic pipeline build panic"));
+            next_job.make_with(|| None);
+        })
+        .join()
+        .expect("the pipeline worker should survive");
+
+        assert!(matches!(failed.made.get(), Some(None)));
+        assert!(matches!(next.made.get(), Some(None)));
+        let mut rebuilt = false;
+        failed.make_with(|| {
+            rebuilt = true;
+            None
+        });
+        assert!(!rebuilt);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missing_distinguishes_omitted_and_pending_pipelines() {
+        let mut omitted = Pending::new(Vec::new(), None);
+        omitted.left_out = Some("ray activation shader without BVH, left out");
+        assert_eq!(
+            missing(&omitted).as_deref(),
+            Some("intentionally omitted: ray activation shader without BVH, left out")
+        );
+
+        let pending = Pending::new(Vec::new(), None);
+        pending.queue_state.store(MAKING, Ordering::Relaxed);
+        assert_eq!(missing(&pending).as_deref(), Some("being made"));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
@@ -663,4 +791,83 @@ mod tests {
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
     }
+
+    #[test]
+    fn skipped_hash_leaves_pipeline_unqueued_and_unmatched_queues_normally() {
+        let shader = |hash: &str| {
+            Arc::new(Shader {
+                stage: "compute",
+                hash: hash.to_owned(),
+                container: Vec::new(),
+                ambient: None,
+                probe: None,
+                translated: OnceLock::from(None),
+            })
+        };
+        let skips = super::super::parse_skip_hashes("32ed072b9f845048");
+
+        let skipped = Arc::new(Pending::new_with_skip_hashes(
+            vec![shader("32ed072b9f845048")],
+            None,
+            &skips,
+        ));
+        assert_eq!(skipped.left_out, Some("skipped by VICTORY_SKIP_PIPELINES"));
+        early(&skipped);
+        assert!(ready(&skipped).is_none());
+        assert_eq!(skipped.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(skipped.made.get().is_none());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            missing(&skipped).as_deref(),
+            Some("intentionally omitted: skipped by VICTORY_SKIP_PIPELINES")
+        );
+
+        let normal = Arc::new(Pending::new_with_skip_hashes(
+            vec![shader("0011223344556677")],
+            None,
+            &skips,
+        ));
+        assert_eq!(normal.left_out, None);
+        assert!(ready(&normal).is_none());
+        assert_ne!(normal.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        let started = Instant::now();
+        while normal.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(matches!(normal.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn rt_pass_left_out_policy_keeps_activation_and_resolve_consistent() {
+        // Default (no BVH builder, no overrides): both passes skipped.
+        let default = LeftOutPolicy::from_values(false, None, None);
+        assert!(default.check(true, false).is_some());
+        assert!(default.check(false, true).is_some());
+        assert_eq!(default.check(false, false), None);
+
+        // VICTORY_RT_RESOLVE=1 without builder must also enable ray activation
+        // so screen-probe rays are actually launched.
+        let resolve_only = LeftOutPolicy::from_values(false, Some("1"), None);
+        assert_eq!(resolve_only.check(true, false), None);
+        assert_eq!(resolve_only.check(false, true), None);
+
+        // Explicit VICTORY_ACTIVATE_RAYS=0 still overrides VICTORY_RT_RESOLVE=1.
+        let resolve_no_activate = LeftOutPolicy::from_values(false, Some("1"), Some("0"));
+        assert_eq!(resolve_no_activate.check(true, false), None);
+        assert!(resolve_no_activate.check(false, true).is_some());
+
+        // VICTORY_BVH_BUILDER=1 enables both, while honoring explicit =0 overrides.
+        let builder = LeftOutPolicy::from_values(true, None, None);
+        assert_eq!(builder.check(true, false), None);
+        assert_eq!(builder.check(false, true), None);
+
+        let builder_no_resolve = LeftOutPolicy::from_values(true, Some("0"), None);
+        assert!(builder_no_resolve.check(true, false).is_some());
+        assert_eq!(builder_no_resolve.check(false, true), None);
+
+        let builder_no_activate = LeftOutPolicy::from_values(true, None, Some("0"));
+        assert_eq!(builder_no_activate.check(true, false), None);
+        assert!(builder_no_activate.check(false, true).is_some());
+    }
+
 }

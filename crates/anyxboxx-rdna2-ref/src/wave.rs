@@ -162,6 +162,18 @@ impl Wave {
         Ok(())
     }
 
+    /// The index of the first of `count` consecutive VGPRs starting at `first`. A group that runs past
+    /// v255 (a 64-bit pair at v255, the four registers of a 128-bit value at v253) is an operand the
+    /// model refuses: the Python raises IndexError there, and indexing `v` directly would panic.
+    pub fn vgpr_group(&self, first: usize, count: usize) -> Result<usize, Error> {
+        if first + count > self.v.len() {
+            return Err(Error::Operand(format!(
+                "groupe de {count} registres vectoriels hors plage : v{first}"
+            )));
+        }
+        Ok(first)
+    }
+
     /// A source of a vector instruction for one lane: a vector register, or a scalar operand.
     pub fn read_lane(&self, code: u32, lane: usize, literal: Option<u32>) -> Result<u32, Error> {
         if code >= VGPR_FIRST {
@@ -174,6 +186,16 @@ impl Wave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_register_group_must_end_at_v255() {
+        let wave = Wave::new(32).unwrap();
+        assert_eq!(wave.vgpr_group(255, 1).unwrap(), 255);
+        assert_eq!(wave.vgpr_group(254, 2).unwrap(), 254);
+        assert_eq!(wave.vgpr_group(252, 4).unwrap(), 252);
+        assert!(matches!(wave.vgpr_group(255, 2), Err(Error::Operand(_))));
+        assert!(matches!(wave.vgpr_group(253, 4), Err(Error::Operand(_))));
+    }
 
     #[test]
     fn mask_write_past_s127_is_refused_without_mutation() {

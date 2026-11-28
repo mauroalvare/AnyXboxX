@@ -1,18 +1,2 @@
 # Pinned fork optimization commits awaiting consolidation in this branch.
 # Each line holds a commit SHA followed by its fork branch name.
-91d327400466912976e75a2687ea2f72e54e1597 codex/warm-failure-fingerprint
-f7124f4b9c584a6ccfd665ae8d863025a9bd30c9 codex/resource-range-index
-6b5e5a5711c7b5a005f6acdf5a295deefafb5cb1 rt/passes/activation-and-gating
-8f82b1548ebb286ebd2a0948cdb8f10c181367a7 rt/passes/scoped-barriers-and-dedup
-f09ccf1e0fa307ffe2a6fda46185d3fd9accbe07 rt/passes/ambient-raise-and-mean-perf
-c5481efbd18c5eb79bde4e397794f55f25a1edf6 rt/passes/resolve-lighting-perf
-cb5ecfe70fed8231f81f3b5254c14470a71d20af rt/passes/preserve-indirect-batch-non-storing-cs
-71e690dec2e4fc83c105ad7db2f4cdb5558fb0c0 codex/rt-stage-coverage
-b26315d1084417bcd4f8c90e2862300cc333a0e0 rt/shaders/bvh-dynamic-descriptor-dmask-and-dir-clamp
-1a7dd21cef9d1d19a1180690937513b93efb8375 rt/shaders/wave64-private-lds-stack
-5cba015766b040d874f8a593525691d976972277 rt/bvh/arena-direct-upload-residency
-27c853057fa46e4411e207681e0ce26b87981795 rt/bvh/arena-locality-and-packing
-8ced8c8dda7c5519e223d771efce462de53e11ae rt/bvh/prep-fast-path-and-batch-watch
-762b6ce5768a4bdb1ba690fd709578f11bc06187 fix/victory-prepare-slot-dedup
-0d1e79f5f7da115b0b06e5b832476af382119c4c fix/victory-dstorage-enqueued-pages
-b945c2f7f0bb7adcdf7cc7f6ac0fdd3b91a26e39 perf/victory-mapped-bytes-batch

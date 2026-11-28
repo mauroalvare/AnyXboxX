@@ -409,18 +409,25 @@ fn copy_args(
     row: u32,
     depth: u32,
 ) -> Option<CopyArgs<'_>> {
+    if c.mips == 0 {
+        return None;
+    }
     let p = c.texture.planes.get(plane as usize)?;
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let height = m.height as usize;
+    let depth_span = depths.checked_sub(1)?.checked_mul(depth as usize)?;
+    let row_span = height.checked_sub(1)?.checked_mul(row as usize)?;
+    let linear = depth_span.checked_add(row_span)?.checked_add(bytes)?;
+    let tiled = usize::try_from(p.offset.checked_add(l.size)?).ok()?;
     Some(CopyArgs {
         layout: l,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled,
         linear,
     })
 }
@@ -988,5 +995,38 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn copy_args_checks_bounds_and_round_trips() {
+        let mut c = std::ptr::null_mut();
+        let d = desc(64, 64, 2, 28, 0x10a);
+        assert_eq!(XGCreateTextureComputer(&d, &mut c), S_OK);
+        let comp = computer(c);
+
+        // Invalid plane is rejected cleanly.
+        assert!(copy_args(comp, 99, 0, 256, 0).is_none());
+
+        // Valid mip 0 args compute exact tiled/linear bounds and round-trip via copy_into/copy_from.
+        let row_pitch = 64 * 4;
+        let args = copy_args(comp, 0, 0, row_pitch, 0).unwrap();
+        assert_eq!(args.linear, 64 * row_pitch as usize);
+
+        let src: Vec<u8> = (0..args.linear)
+            .map(|i| ((i * 17 + 3) & 0xff) as u8)
+            .collect();
+        let mut tiled = vec![0u8; args.tiled];
+        let mut dst = vec![0u8; args.linear];
+        assert_eq!(
+            copy_into(c, tiled.as_mut_ptr(), 0, 0, src.as_ptr(), row_pitch, 0),
+            S_OK
+        );
+        assert_eq!(
+            copy_from(c, dst.as_mut_ptr(), 0, 0, 0, tiled.as_ptr(), row_pitch, 0),
+            S_OK
+        );
+        assert_eq!(dst, src);
+
+        assert_eq!(release(c), 0);
     }
 }

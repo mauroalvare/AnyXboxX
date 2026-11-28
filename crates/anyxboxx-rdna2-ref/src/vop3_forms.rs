@@ -276,8 +276,9 @@ pub fn mad64(
             i128::from(a) * i128::from(b) + i128::from(c)
         };
         let bits = total as u128;
-        wave.v[fields.vdst as usize][lane] = (bits as u64 & MASK32) as u32;
-        wave.v[fields.vdst as usize + 1][lane] = ((bits as u64 >> 32) & 0xFFFF_FFFF) as u32;
+        let destination = wave.vgpr_group(fields.vdst as usize, 2)?;
+        wave.v[destination][lane] = (bits as u64 & MASK32) as u32;
+        wave.v[destination + 1][lane] = ((bits as u64 >> 32) & 0xFFFF_FFFF) as u32;
         if !signed && bits >> 64 != 0 {
             carries |= 1u64 << lane;
         }

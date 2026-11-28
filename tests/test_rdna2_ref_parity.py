@@ -21,7 +21,8 @@ from emu import rdna2_exec, rdna2_image
 from emu.rdna2_exec import VOP2_CARRY, Wave
 from emu.rdna2_exec_cmp64 import COMPARE64
 from emu.rdna2_exec_dot import OPERATIONS as DOT_OPERATIONS
-from emu.rdna2_exec_int16 import PACKED
+from emu.rdna2_exec_f16 import OPERATIONS as F16_OPERATIONS
+from emu.rdna2_exec_int16 import PACKED, VOP3 as INT16_VOP3
 from emu.rdna2_exec_pkf16 import PACKED_F16, VOP3P as PKF16_VOP3P
 from emu.rdna2_exec_memory import PAGE
 from emu.rdna2_exec_movrel import SCALAR as MOVREL_SCALAR, VECTOR as MOVREL_VECTOR
@@ -193,6 +194,46 @@ def test_fixed_vector_programs_match_the_python_model():
         assert_same(exe, lanes, scc, scalars, words)
 
 
+# Operand values of the unfused multiply-add test: a finite value, +inf, +0, and a NaN whose payload
+# names its position (0A, 0B, 0C), so that the NaN that comes out says which operand it was.
+MUL_ADD_NANS = (0x7FC0_0A0A, 0x7FC0_0B0B, 0x7FC0_0C0C)
+MUL_ADD_VALUES = (0x3FC0_0000, 0x7F80_0000, 0x0000_0000)
+
+
+def mul_add_programs():
+    """(name, words) of every unfused multiply-add form with each operand position finite, infinite, zero
+    or NaN. The model's `_mul_add` keeps the NaN of the product (a factor, or ∞ × 0) before a NaN addend."""
+    load = lambda register, bits: [vop1("v_mov_b32", register, LITERAL), bits]
+    programs = []
+    for first in (*MUL_ADD_VALUES, MUL_ADD_NANS[0]):
+        for second in (*MUL_ADD_VALUES, MUL_ADD_NANS[1]):
+            for third in (*MUL_ADD_VALUES, MUL_ADD_NANS[2]):
+                registers = load(1, first) + load(2, second) + load(3, third)
+                programs += [
+                    ("v_mad_f32", program(*registers, *vop3("v_mad_f32", 4, (V0 + 1, V0 + 2, V0 + 3)))),
+                    ("v_mac_f32", program(*registers, vop2("v_mac_f32", 3, V0 + 1, 2))),
+                    ("v_mac_f32 (VOP3)", program(*registers, *vop3("v_mac_f32", 3, (V0 + 1, V0 + 2, 128)))),
+                    ("v_madak_f32", program(*load(1, first) + load(2, second), vop2("v_madak_f32", 4, V0 + 1, 2), third)),
+                    ("v_madmk_f32", program(*load(1, first) + load(2, third), vop2("v_madmk_f32", 4, V0 + 1, 2), second)),
+                ]
+    return programs
+
+
+def test_unfused_multiply_add_nans_match_the_python_model():
+    """v_mad_f32, v_mac_f32 (VOP2 and VOP3), v_madak_f32 and v_madmk_f32 on every mix of finite, infinite,
+    zero and NaN operands: the same NaN as the model, which keeps the product's NaN before the addend's."""
+    exe = binary()
+    for _, words in mul_add_programs():
+        assert_same(exe, 32, False, [], words)
+    # The values themselves, so that two models wrong in the same way cannot pass.
+    madak = program(vop1("v_mov_b32", 1, LITERAL), 0x3FC0_0000, vop1("v_mov_b32", 2, LITERAL), MUL_ADD_NANS[1],
+                    vop2("v_madak_f32", 4, V0 + 1, 2), MUL_ADD_NANS[2])
+    assert "\nv 4 7FC00B0B" in run_python(32, False, [], madak)
+    infinity_times_zero = program(vop1("v_mov_b32", 1, LITERAL), 0x7F80_0000, vop1("v_mov_b32", 3, LITERAL),
+                                  MUL_ADD_NANS[2], *vop3("v_mad_f32", 4, (V0 + 1, V0 + 2, V0 + 3)))
+    assert "\nv 4 FFC00000" in run_python(32, False, [], infinity_times_zero)
+
+
 def test_a_literal_operand_is_the_second_word_in_both_models():
     exe = binary()
     words = program(sop1("s_mov_b32", 0, 255), 0xDEAD_BEEF, sop2("s_xor_b32", 1, 0, 255), 0x0F0F_0F0F)
@@ -207,6 +248,24 @@ def test_inline_double_constants_match_the_python_model():
                                 sop2("s_xor_b64", 4, source, 193)):
                 assert_same(exe, lanes, False, [], program(instruction))
             assert_same(exe, lanes, False, [], program(vopc("v_cmp_eq_f64", source, 0)))
+
+
+def test_signed_64_bit_sources_sign_extend_a_literal_in_both_models():
+    """ISA section 6.2.1 (p. 43): a 32-bit literal is sign-extended for a signed 64-bit source (s_ashr_i64,
+    s_bfe_i64, s_flbit_i32_i64) and zero-extended for the unsigned and bitwise ones."""
+    exe = binary()
+    control = [(60, 40 << 16 | 4)]                                   # s_bfe: offset 4, width 40
+    for value in (0x8000_0000, 0xFFFF_FFF0, 0xFACE_5766, 0x7FFF_FFFF, 0):
+        for words in (
+            program(sop2("s_ashr_i64", 40, LITERAL, 129), value), program(sop2("s_ashr_i64", 40, LITERAL, 132), value),
+            program(sop2("s_bfe_i64", 44, LITERAL, 60), value), program(sop2("s_bfe_u64", 46, LITERAL, 60), value),
+            program(sop1("s_flbit_i32_i64", 51, LITERAL), value), program(sop1("s_flbit_i32_b64", 52, LITERAL), value),
+            program(sop1("s_mov_b64", 48, LITERAL), value),
+        ):
+            assert_same(exe, 32, False, control, words)
+    # The values themselves, so that two models wrong in the same way cannot pass.
+    assert "s 51 0000003C\n" in run_python(32, False, [], program(sop1("s_flbit_i32_i64", 51, LITERAL), 0xFFFF_FFF0))
+    assert "s 52 00000020\n" in run_python(32, False, [], program(sop1("s_flbit_i32_b64", 52, LITERAL), 0xFFFF_FFF0))
 
 
 def test_scalar_packs_match_the_python_model():
@@ -282,6 +341,8 @@ def random_program(rng):
             or name in COMPARE64
             or name in WIDE_GENERIC
             or name in MOVREL_VECTOR
+            or name in F16_ARITH_NAMES
+            or name in INT16_VOP3
         ):
             names[family].append((opcode, name))
         if family == "VOP1" and (name in WIDE_GENERIC or name in MOVREL_VECTOR):
@@ -290,7 +351,9 @@ def random_program(rng):
             names[family].append((opcode, name))
         if family == "VOPC" and (name in VECTOR_COMPARE or name in COMPARE64):
             names[family].append((opcode, name))
-        if family in VECTOR_FAMILIES and (name in VECTOR or name in VECTOR_NO_OPERATION or name in VOP2_CARRY):
+        if family in VECTOR_FAMILIES and (
+            name in VECTOR or name in VECTOR_NO_OPERATION or name in VOP2_CARRY or name in F16_ARITH_NAMES
+        ):
             names[family].append((opcode, name))
     blocks = []  # (words, branch template or None): a branch's offset is patched once the layout is known
     for _ in range(rng.randrange(1, 11)):
@@ -368,6 +431,8 @@ def instruction(rng, names):
 # for the Python model (which indexes SGPRs and register pairs directly).
 # Operations whose constant is a literal: the VOP3 form has no literal word unless a source is the literal code.
 LITERAL_OPERATION_NAMES = ("v_madmk_f32", "v_madak_f32", "v_fmamk_f32", "v_fmaak_f32")
+F16_TRANSCENDENTALS = frozenset({"v_rcp_f16", "v_sqrt_f16", "v_rsq_f16", "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16"})
+F16_ARITH_NAMES = tuple(name for name in F16_OPERATIONS if name not in F16_TRANSCENDENTALS)
 # The 64-bit operations (including v_fma_f64 now that overflow returns ±infinity in both models).
 WIDE_GENERIC = tuple(WIDE_OPERATIONS)
 DIV_NAMES = (
@@ -386,8 +451,10 @@ def vop3_words(rng, opcode, name):
     if name in COMPARE64 and not name.endswith("class_f32"):
         pool = [code for code in OPERANDS if code != LITERAL] + list(range(256, 511))
     sources = [rng.choice(OPERANDS + pool) for _ in range(3)]
-    # The SAD forms refuse any modifier: most of them get none, so that the executed path is covered too.
-    plain = (name in SAD_NAMES or name in MOVREL_VECTOR) and rng.random() < 0.7
+    # The SAD, f16 and 16-bit integer forms refuse unsupported modifiers: most of them get none, so the executed
+    # path is covered too.
+    plain = (name in SAD_NAMES or name in MOVREL_VECTOR or name in F16_ARITH_NAMES or name in INT16_VOP3) and (
+        rng.random() < 0.7)
     if name in MOVREL_VECTOR:
         sources[0] = rng.randrange(256, 511)
     abs_bits = 0 if plain else rng.randrange(8)
@@ -403,7 +470,7 @@ def vop3_words(rng, opcode, name):
     if name.endswith("_f64") and name not in COMPARE64:
         vdst = rng.randrange(255)                                    # a 64-bit result takes vdst and vdst + 1
         field_8_14 = rng.randrange(126)                              # the carry SGPR pair sdst
-    low = 0x35 << 26 | opcode << 16 | vdst | field_8_14 << 8 | rng.randrange(16) << 11 | clamp << 15
+    low = 0x35 << 26 | opcode << 16 | vdst | field_8_14 << 8 | (0 if plain else rng.randrange(16)) << 11 | clamp << 15
     high = sources[0] | sources[1] << 9 | sources[2] << 18 | (0 if plain else rng.randrange(4)) << 27 | (
         0 if plain else rng.randrange(8)) << 29
     words = [low, high]
@@ -441,6 +508,27 @@ def test_random_scalar_programs_match_the_python_model():
         scalars.append((124, rng.randrange(256)))                    # M0, the index of the movrel forms
         words = program(*random_program(rng))
         assert_same(exe, lanes, scc, scalars, words)
+
+
+def test_indexed_registers_past_32_bits_are_refused_by_both_models():
+    """M0 is a full 32-bit value: a register number plus M0 past 2^32 is outside the model in both
+    interpreters, never the register a wrapping 32-bit sum would give (47 + 0xFFFFFFFD is not s44)."""
+    exe = binary()
+    cases = [
+        program(sop1("s_movrels_b32", 102, 47)), program(sop1("s_movrels_b64", 102, 47)),
+        program(sop1("s_movreld_b32", 47, 44)), program(sop1("s_movreld_b64", 47, 44)),
+        program(vop1("v_movrels_b32", 5, V0 + 3)), program(vop1("v_movreld_b32", 5, V0 + 3)),
+        program(vop1("v_movrelsd_b32", 5, V0 + 3)),
+    ]
+    registers = [(44, 0x1234_5678), (45, 0x9ABC_DEF0), (47, 0x0BAD_F00D)]
+    for words in cases:
+        for m0 in (0xFFFF_FFFD, 0xFFFF_FFFF, 0x8000_0000):
+            scalars = [(124, m0), *registers]
+            assert run_python(32, False, scalars, words) == "error untranslated\n"
+            assert_same(exe, 32, False, scalars, words)
+        in_range = [(124, 1), *registers]
+        assert run_python(32, False, in_range, words).startswith("steps")
+        assert_same(exe, 32, False, in_range, words)
 
 
 def test_vop3_literal_operations_match_the_python_model():
@@ -1366,6 +1454,72 @@ def test_pk_fmac_forms_match_the_python_model():
 def vop3(name, vdst, sources, op_sel=0, clamp=0, abs_bits=0, neg=0, omod=0):
     low = 0x35 << 26 | OPCODES["VOP3", name] << 16 | vdst | abs_bits << 8 | op_sel << 11 | clamp << 15
     return low, sources[0] | sources[1] << 9 | sources[2] << 18 | omod << 27 | neg << 29
+
+
+# Source registers of the register-group tests, filled with a different value in every lane and register,
+# so that the programs that fit write non-zero, distinguishable results.
+GROUP_SOURCES = (*range(1, 8), *range(250, 256))
+
+
+def fill_group_sources():
+    """v_mul_u32_u24 vN = (0x12345 + 0x1111 × N) × lane, for every register of GROUP_SOURCES."""
+    words = []
+    for register in GROUP_SOURCES:
+        words += [vop2("v_mul_u32_u24", register, LITERAL, 0), 0x12345 + 0x1111 * register]
+    return words
+
+
+def test_a_register_group_past_v255_is_an_operand_error_in_rust():
+    """A 64-bit result at v255 has no second register, a 64-bit source pair at v255 neither, and a 128-bit
+    group has none from v253 up. The Rust returns an operand error before writing anything (it used to
+    abort on an out-of-bounds index). The Python model raises IndexError, after writing the low half in
+    the first active lane: that is a crash, not a refusal, and the parity harness turns it into no error
+    line, so the two cannot be compared on these programs yet. Whether the Python should refuse them
+    (and both print the same error line) is left to the maintainers; this test pins the current pairing.
+    The same group one register lower fits, and both models run it to the same state."""
+    exe = binary()
+    wide, quad = (V0 + 2, V0 + 4, V0 + 6), (V0 + 2, V0 + 1, V0 + 4)
+    cases = [                                                        # (name, sources, last register that fits)
+        ("v_ashrrev_i64", (129, V0 + 2, 128), 254), ("v_add_f64", wide, 254), ("v_fma_f64", wide, 254),
+        ("v_div_scale_f64", wide, 254), ("v_div_fmas_f64", wide, 254), ("v_div_fixup_f64", wide, 254),
+        ("v_mad_u64_u32", (V0 + 1, V0 + 3, V0 + 2), 254), ("v_qsad_pk_u16_u8", quad, 254),
+        ("v_mqsad_pk_u16_u8", quad, 254), ("v_mqsad_u32_u8", quad, 252),
+    ]
+    programs = [(program(*fill_group_sources(), *vop3(name, last + 1, sources)),
+                 program(*fill_group_sources(), *vop3(name, last, sources)))
+                for name, sources, last in cases]
+    for name in ("v_floor_f64", "v_cvt_f64_i32"):                    # VOP1: a 64-bit result from one source
+        programs.append((program(*fill_group_sources(), vop1(name, 255, V0 + 2)),
+                         program(*fill_group_sources(), vop1(name, 254, V0 + 2))))
+    # The wide S2 source of the SAD forms: a 64-bit pair at v255 (then v254), four VGPRs at v253 (then v252).
+    for name, past, fits in (("v_qsad_pk_u16_u8", 255, 254), ("v_mqsad_pk_u16_u8", 255, 254),
+                             ("v_mqsad_u32_u8", 253, 252)):
+        programs.append((program(*fill_group_sources(), *vop3(name, 8, (V0 + 2, V0 + 1, V0 + past))),
+                         program(*fill_group_sources(), *vop3(name, 8, (V0 + 2, V0 + 1, V0 + fits)))))
+    for past, fits in programs:
+        assert run_rust(exe, 32, False, [], past) == "error operand\n"
+        with pytest.raises(IndexError):
+            run_python(32, False, [], past)
+        state = run_python(32, False, [], fits)
+        assert state.startswith("steps")
+        assert_same(exe, 32, False, [], fits)
+
+
+def test_cndmask_mask_refusals_do_not_depend_on_exec_in_both_models():
+    """VOP3 v_cndmask_b32 reads its lane mask (S2) as a scalar operand. A VGPR or a reserved code there is
+    refused by both models whatever EXEC holds; a readable mask (VCC) runs in both, with or without lanes."""
+    exe = binary()
+    lanes_off = [(126, 0), (127, 0)]
+    for lanes in (32, 64):
+        for mask_code in (V0 + 4, 209):
+            words = program(*vop3("v_cndmask_b32", 3, (V0 + 1, V0 + 2, mask_code)))
+            for scalars in ([], lanes_off):
+                assert run_python(lanes, False, scalars, words) == "error untranslated\n"
+                assert_same(exe, lanes, False, scalars, words)
+        words = program(vop1("v_mov_b32", 2, LITERAL), 0x5555, *vop3("v_cndmask_b32", 3, (V0 + 1, V0 + 2, 106)))
+        for scalars in ([(106, 0xF0F0_F0F0), (107, 0x0F0F_0F0F)], [(106, 0xF0F0_F0F0), *lanes_off]):
+            assert run_python(lanes, False, scalars, words).startswith("steps")
+            assert_same(exe, lanes, False, scalars, words)
 
 
 def test_vop3_integer_clamp_matches_the_python_model():
