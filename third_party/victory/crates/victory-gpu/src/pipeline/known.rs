@@ -24,7 +24,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use anyhow::Context;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+};
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
@@ -284,15 +288,37 @@ fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
     })
 }
 
-/// What a driver's cached pipelines depend on besides the title's: the
-/// translator with its settings, and the driver.
-pub fn fingerprint() -> String {
-    let mut h = blake3::Hasher::new();
-    h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
-        h.update(&host.driver().to_le_bytes());
-    }
-    h.finalize().to_hex()[..16].to_owned()
+/// Compiler context for a warm attempt on the selected D3D12 device.
+#[derive(Clone, Copy)]
+pub struct WarmCacheMetadata {
+    pub translation: [u8; 32],
+    pub software: bool,
+    /// Vendor, device, subsystem and revision. These persist across boots.
+    pub adapter: [u32; 4],
+    pub driver: i64,
+}
+
+/// Read the selected adapter rather than inferring the backend from a switch.
+/// A journal cannot establish a match when the host or driver is unknown.
+pub fn warm_cache_metadata() -> anyhow::Result<WarmCacheMetadata> {
+    let host = crate::host::host().context("D3D12 warm device unavailable")?;
+    let driver = host.driver();
+    anyhow::ensure!(driver != 0, "DXGI driver version unavailable for the warm adapter");
+    // SAFETY: query the adapter description by its live device's LUID.
+    let desc = unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            .context("creating the DXGI factory for warm adapter metadata")?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid())
+            .context("finding the selected warm adapter in DXGI")?;
+        adapter.GetDesc1().context("reading the selected warm adapter description")?
+    };
+    Ok(WarmCacheMetadata {
+        // Host creation establishes the adapter's wave settings first.
+        translation: crate::shader_cache::translation(),
+        software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        adapter: [desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision],
+        driver,
+    })
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is

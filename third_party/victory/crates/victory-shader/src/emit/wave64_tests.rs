@@ -1943,3 +1943,841 @@ fn readfirstlane_uses_both_halves_of_the_console_wave() {
         same_as_console(&actual, &want);
     }
 }
+
+/// Synthetic 3-level BVH (`box32` root -> 2 `box16` + 2 `box32` children -> 4
+/// `triangle` leaves with known geometry) plus a CPU traversal oracle using
+/// [`crate::bvh::intersect`].
+fn synthetic_bvh_scene() -> (Vec<u32>, u32) {
+    use crate::bvh::{self, tests as nodes};
+
+    let mut words: Vec<u32> = Vec::new();
+    let add = |words: &mut Vec<u32>, node: [u32; 28], dwords: usize, kind: u32| -> u32 {
+        let start_bytes = (words.len() * 4) as u32;
+        let take = dwords.min(node.len());
+        words.extend_from_slice(&node[..take]);
+        if dwords > take {
+            words.resize(words.len() + (dwords - take), 0);
+        }
+        (start_bytes >> 3) | kind
+    };
+
+    // Reserve 32 dwords at offset 0 for the root box32 node (filled last).
+    words.resize(32, 0);
+
+    // Leaf triangles at known depths & positions (clockwise seen from z=0 looking +z).
+    // Tri 0 (front-left, z=4): x in [-3, -1], y in [-1, 1]
+    let t0 = [[-2.0, 1.0, 4.0], [-1.0, -1.0, 4.0], [-3.0, -1.0, 4.0]];
+    // Tri 1 (back-left behind t0, z=8): x in [-3, -1], y in [-1, 1]
+    let t1 = [[-2.0, 1.0, 8.0], [-1.0, -1.0, 8.0], [-3.0, -1.0, 8.0]];
+    // Tri 2 (center, z=5): x in [-1, 1], y in [-1, 1]
+    let t2 = [[0.0, 1.0, 5.0], [1.0, -1.0, 5.0], [-1.0, -1.0, 5.0]];
+    // Tri 3 (right, z=6): x in [1, 3], y in [-1, 1]
+    let t3 = [[2.0, 1.0, 6.0], [3.0, -1.0, 6.0], [1.0, -1.0, 6.0]];
+
+    let p_t0 = add(&mut words, nodes::triangles(&t0, 9), 16, 0);
+    let p_t1 = add(&mut words, nodes::triangles(&t1, 9), 16, 0);
+    let p_t2 = add(&mut words, nodes::triangles(&t2, 9), 16, 0);
+    let p_t3 = add(&mut words, nodes::triangles(&t3, 9), 16, 0);
+
+    let off = [f32::NAN; 6];
+    let b_t0 = [-3.0, -1.0, 3.5, -1.0, 1.0, 4.5];
+    let b_t1 = [-3.0, -1.0, 7.5, -1.0, 1.0, 8.5];
+    let b_t2 = [-1.0, -1.0, 4.5, 1.0, 1.0, 5.5];
+    let b_t3 = [1.0, -1.0, 5.5, 3.0, 1.0, 6.5];
+
+    // Child 0 (box16): holds t0 (near) and t1 (far behind t0).
+    let p_left = add(
+        &mut words,
+        nodes::box16([p_t0, p_t1, bvh::NONE, bvh::NONE], [b_t0, b_t1, off, off]),
+        16,
+        4,
+    );
+    // Child 1 (box32): holds t2 (center).
+    let p_mid = add(
+        &mut words,
+        nodes::box32([p_t2, bvh::NONE, bvh::NONE, bvh::NONE], [b_t2, off, off, off]),
+        32,
+        5,
+    );
+    // Child 2 (box16): holds t3 (right).
+    let p_right = add(
+        &mut words,
+        nodes::box16([p_t3, bvh::NONE, bvh::NONE, bvh::NONE], [b_t3, off, off, off]),
+        16,
+        4,
+    );
+
+    let root = nodes::box32(
+        [p_left, p_mid, p_right, bvh::NONE],
+        [
+            [-3.0, -1.0, 3.5, -1.0, 1.0, 8.5],
+            [-1.0, -1.0, 4.5, 1.0, 1.0, 5.5],
+            [1.0, -1.0, 5.5, 3.0, 1.0, 6.5],
+            off,
+        ],
+    );
+    words[..28].copy_from_slice(&root);
+    let root_ptr = 5u32; // offset 0, kind 5 (box32)
+    (words, root_ptr)
+}
+
+/// CPU reference traversal matching [`wave64_bvh_traversal_program`]: pops a
+/// node from a per-thread stack, invokes [`crate::bvh::intersect`], pushes
+/// valid box children (farthest first so nearest is popped first), and keeps
+/// the first/closest triangle hit (`[t, det, i, j]` or `MISS`).
+fn cpu_traverse(bvh_words: &[u32], root_ptr: u32, ray: &crate::bvh::Ray, steps: u32) -> [u32; 4] {
+    use crate::bvh;
+    let mut stack = vec![root_ptr];
+    let mut best = bvh::MISS.map(f32::to_bits);
+    let mut r = *ray;
+    for _ in 0..steps {
+        let Some(node_ptr) = stack.pop() else {
+            break;
+        };
+        let kind = node_ptr & 7;
+        let off_words = (((node_ptr >> 3) << 6) / 4) as usize;
+        let node: [u32; 28] = std::array::from_fn(|k| bvh_words.get(off_words + k).copied().unwrap_or(0));
+        let res = bvh::intersect(&node, kind, &r, true);
+        if kind >= 4 {
+            // Push farthest-first so nearest hit is popped next.
+            for &child in res.iter().rev() {
+                if child != bvh::NONE {
+                    stack.push(child);
+                }
+            }
+        } else if res[0] != f32::INFINITY.to_bits() {
+            let t = f32::from_bits(res[0]) / f32::from_bits(res[1]);
+            if t < r.extent {
+                r.extent = t;
+                best = res;
+            }
+        }
+    }
+    best
+}
+
+/// Builds a wave64 (`threads = [64, 1, 1]`, 4 KiB LDS) multi-level BVH
+/// traversal compute shader using `image_bvh64_intersect_ray` and a per-thread
+/// bank-conflict-free SoA LDS traversal stack (`addr = (sp << 8) + (v0 << 2)`
+/// maintained via `v22 = v0 << 2`, `v22 += 256` on push, `v22 -= 256` on pop).
+///
+/// - When `divergent` is `true`, the traversal loop uses `s_and_saveexec_b64` +
+///   `s_cbranch_execz` around the stack pop/push (a lane-branch region reading
+///   and writing LDS, as real RT traversal shaders emit).
+/// - When `divergent` is `false`, every lane runs a fixed `s0`-step uniform
+///   loop with per-lane `exec` guards around the stack ops (so `origin/main`
+///   lowers it to wave32 with `split_lds = true`, allowing a direct apples-to-
+///   apples GPU benchmark on the RTX 5070 Ti).
+/// - When `with_wave_op` is `true`, a cross-half wave instruction
+///   (`v_mbcnt_lo_u32_b32`) runs in entry so `console_lanes` and `crosses` are
+///   both set, isolating `split_lds` barrier removal while keeping `halves` +
+///   `exchange` + `WaveSize(32)`.
+fn wave64_bvh_traversal_program(divergent: bool, with_wave_op: bool) -> NativeProgram {
+    // Registers:
+    // s0: step count
+    // s4: descriptor table byte offset (slot 0: ray SRV, slot 1: out UAV, slot 2: BVH SRV)
+    // s5: group_id.x (TGID_X_EN)
+    // v[1:12]: image_bvh64_intersect_ray operands (v1=ptr_lo, v2=0, v3=extent, v4..v12=ray)
+    // v[13:16]: image_bvh64_intersect_ray result
+    // v[24:27]: closest hit accumulator (init to bvh::MISS)
+    // v22: per-thread SoA LDS stack byte offset (init v0 << 2, +/- 256 per push/pop)
+    // v23: stack depth (init 1)
+    let mut w: Vec<u32> = vec![
+        0xBE86_0305, // s_mov_b32 s6, s5 (group_id.x)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (ray records SRV)
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (output UAV)
+        0xF408_0402,
+        0xFA00_0040, // s_load_dwordx4 s[16:19], s[4:5], 0x40 (BVH buffer SRV)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    if with_wave_op {
+        // Cross-half wave op (`console_lanes = true`, `crosses = true`), result unused in addr.
+        w.extend_from_slice(&[
+            0xD765_001C,
+            0x0001_007E, // v_mbcnt_lo_u32_b32 v28, exec_lo, 0
+        ]);
+    }
+    w.extend_from_slice(&[
+        // global_tid = group_id.x * 64 + v0
+        0x7E28_0206, // v_mov_b32 v20, s6
+        0x3428_2886, // v_lshlrev_b32 v20, 6, v20
+        0x4A28_2900, // v_add_nc_u32 v20, v0, v20
+        0x342A_2886, // v_lshlrev_b32 v21, 6, v20 (global_tid * 64)
+        0x343A_2884, // v_lshlrev_b32 v29, 4, v20 (global_tid * 16 for output store)
+        // Load ray record into v[1:12]
+        0xE038_1000,
+        0x8002_0115, // buffer_load_dwordx4 v[1:4], v21, s[8:11], 0 offen
+        0xE038_1010,
+        0x8002_0515, // buffer_load_dwordx4 v[5:8], v21, s[8:11], 0 offen offset:16
+        0xE038_1020,
+        0x8002_0915, // buffer_load_dwordx4 v[9:12], v21, s[8:11], 0 offen offset:32
+        0xBF8C_0F70, // s_waitcnt vmcnt(0)
+        // Init closest hit v[24:27] = MISS (+inf, 1.0, 0.0, 0.0)
+        0x7E30_02FF,
+        f32::INFINITY.to_bits(), // v_mov_b32 v24, +inf
+        0x7E32_02F2,             // v_mov_b32 v25, 1.0
+        0x7E34_0280,             // v_mov_b32 v26, 0
+        0x7E36_0280,             // v_mov_b32 v27, 0
+        // Init per-thread SoA LDS stack: v22 = v0 << 2, push root (v1), v22 += 256, v23 = 1
+        0x342C_0082, // v_lshlrev_b32 v22, 2, v0
+    ]);
+    w.extend_from_slice(&ds(DS_WRITE_B32, 0, 22, 1)); // ds_write_b32 v22, v1
+    w.extend_from_slice(&[
+        0x4A2C_2CFF,
+        256,         // v_add_nc_u32 v22, 256, v22
+        0x7E2E_0281, // v_mov_b32 v23, 1 (sp = 1)
+        0xBE96_0300, // s_mov_b32 s22, s0 (step counter)
+    ]);
+
+    // Build traversal step body (used inside loop).
+    let mut step_body: Vec<u32> = Vec::new();
+    // Save exec in s[24:25], mask active lanes with sp > 0 (0 < v23)
+    step_body.extend_from_slice(&[
+        0x7D82_2E80, // v_cmp_lt_u32 vcc, 0, v23
+        0xBE98_246A, // s_and_saveexec_b64 s[24:25], vcc
+    ]);
+    // Inner body: pop node, intersect, push children or record hit.
+    let mut inner: Vec<u32> = Vec::new();
+    // Pop: v22 -= 256, v23 -= 1, ds_read_b32 v1, v22
+    inner.extend_from_slice(&[
+        0x4E2C_2CFF,
+        256,         // v_subrev_nc_u32 v22, 256, v22
+        0x4E2E_2E81, // v_subrev_nc_u32 v23, 1, v23
+    ]);
+    inner.extend_from_slice(&ds(DS_READ_B32, 1, 22, 0)); // ds_read_b32 v1, v22
+    inner.extend_from_slice(&[
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        // image_bvh64_intersect_ray v[13:16], [v1..v12], s[16:19]
+        0xF19C_9F07,
+        0x0004_0D01,
+        0x0504_0302,
+        0x0908_0706,
+        0x000C_0B0A,
+        0xBF8C_0F70, // s_waitcnt vmcnt(0)
+        // Check box vs triangle: v17 = v1 & 7; box iff 4 <= v17 (3 < v17)
+        0x3622_0287, // v_and_b32 v17, 7, v1
+        0x7D82_2283, // v_cmp_lt_u32 vcc, 3, v17 (box?)
+        0xBE9A_246A, // s_and_saveexec_b64 s[26:27], vcc
+    ]);
+    // For box lanes: push v16, v15, v14, v13 if != NONE (0xffff_ffff)
+    for child_reg in [16u8, 15, 14, 13] {
+        // v_cmp_ne_u32 vcc, -1, v<child_reg>
+        inner.push(0x7D8A_00C1 | (u32::from(child_reg) << 9));
+        inner.push(0xBE9C_246A); // s_and_saveexec_b64 s[28:29], vcc
+        inner.extend_from_slice(&ds(DS_WRITE_B32, 0, 22, child_reg));
+        inner.extend_from_slice(&[
+            0x4A2C_2CFF,
+            256,         // v_add_nc_u32 v22, 256, v22
+            0x4A2E_2E81, // v_add_nc_u32 v23, 1, v23
+            0xBEFE_041C, // s_mov_b64 exec, s[28:29]
+        ]);
+    }
+    // Switch to triangle lanes: s_andn2_b64 exec, s[26:27], exec
+    inner.extend_from_slice(&[
+        0x8AFE_7E1A, // s_andn2_b64 exec, s[26:27], exec
+        // Hit check: v13 != +inf
+        0x7D8A_1AFF,
+        f32::INFINITY.to_bits(), // v_cmp_ne_u32 vcc, +inf, v13
+        0xBE9C_246A,             // s_and_saveexec_b64 s[28:29], vcc
+        // t = v13 * rcp(v14) (exact for power-of-two denominators in our scene)
+        0x7E24_550E, // v_rcp_f32 v18, v14
+        0x1024_1B12, // v_mul_f32 v18, v18, v13 (t = v13 * rcp(v14))
+        // Keep closest: v18 < v3 (extent)
+        0x7C02_0712, // v_cmp_lt_f32 vcc, v18, v3
+        0xBE9E_246A, // s_and_saveexec_b64 s[30:31], vcc
+        0x7E06_0312, // v_mov_b32 v3, v18 (update extent)
+        0x7E30_030D, // v_mov_b32 v24, v13
+        0x7E32_030E, // v_mov_b32 v25, v14
+        0x7E34_030F, // v_mov_b32 v26, v15
+        0x7E36_0310, // v_mov_b32 v27, v16
+        0xBEFE_041E, // s_mov_b64 exec, s[30:31]
+        0xBEFE_041C, // s_mov_b64 exec, s[28:29]
+        0xBEFE_041A, // s_mov_b64 exec, s[26:27]
+    ]);
+    if divergent {
+        // Explicit branch skipping inner when no lane has sp > 0 -> creates a
+        // lane-branch region containing both ds_read_b32 and ds_write_b32.
+        step_body.push(0xBF88_0000 | inner.len() as u32); // s_cbranch_execz +inner.len()
+    }
+    step_body.extend_from_slice(&inner);
+    step_body.extend_from_slice(&[
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+        0x8096_8116, // s_sub_u32 s22, s22, 1
+        0xBF08_8016, // s_cmp_gt_u32 s22, 0
+    ]);
+    let back_dwords = (step_body.len() + 1) as i16;
+    step_body.push(0xBF85_0000 | u32::from((-back_dwords) as u16)); // s_cbranch_scc1 loop_top
+
+    w.extend_from_slice(&step_body);
+    w.extend_from_slice(&[
+        // Store closest hit v[24:27] at global_tid * 16
+        0xE078_1000,
+        0x8003_181D, // buffer_store_dwordx4 v[24:27], v29, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+
+    let table = |kind, at| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: at,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 32,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            table(ResourceType::Srv, 0),
+            table(ResourceType::Uav, 8),
+            table(ResourceType::Srv, 16),
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (5 << 1) | (1 << 7) | (8 << 15), // s0..s4 user, s5 = group_id.x, 4 KiB LDS (depth up to 16)
+            threads: [64, 1, 1],
+        }),
+        code: w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    }
+}
+
+/// Builds a deeper 4-level overlapping synthetic BVH so benchmark rays exercise
+/// 10-16 active stack pops/pushes per ray (stack depth up to 8 entries) with
+/// realistic hit/miss/occlusion geometry.
+fn synthetic_bvh_scene_deep() -> (Vec<u32>, u32) {
+    use crate::bvh::{self, tests as nodes};
+
+    let mut words: Vec<u32> = Vec::new();
+    let add = |words: &mut Vec<u32>, node: [u32; 28], dwords: usize, kind: u32| -> u32 {
+        let start_bytes = (words.len() * 4) as u32;
+        let take = dwords.min(node.len());
+        words.extend_from_slice(&node[..take]);
+        if dwords > take {
+            words.resize(words.len() + (dwords - take), 0);
+        }
+        (start_bytes >> 3) | kind
+    };
+    words.resize(32, 0);
+    let off = [f32::NAN; 6];
+
+    // 4 depth layers along z = 4, 6, 8, 10; each layer has 4 x-bands covering [-4, 4].
+    // Rays aimed at x in [-3, 3] intersect all 4 overlapping mid-boxes along z,
+    // pushing multiple children onto the per-thread LDS stack before culling by extent.
+    let mut mid_ptrs = [bvh::NONE; 4];
+    let mut mid_boxes = [off; 4];
+    for layer in 0..4usize {
+        let z = 4.0 + 2.0 * (layer as f32);
+        let mut leaf_ptrs = [bvh::NONE; 4];
+        let mut leaf_boxes = [off; 4];
+        for band in 0..4usize {
+            let x0 = -3.0 + 1.5 * (band as f32);
+            let x1 = x0 + 1.5;
+            let xm = 0.5 * (x0 + x1);
+            // Alternate triangle y-coverage so some layers miss the triangle inside its AABB
+            // and keep traversing deeper layers.
+            let y_lo = if (layer + band) % 2 == 0 { -1.0 } else { 0.25 };
+            let y_hi = if (layer + band) % 2 == 0 { 1.0 } else { 1.0 };
+            let tri = [[xm, y_hi, z], [x1, y_lo, z], [x0, y_lo, z]];
+            leaf_ptrs[band] = add(&mut words, nodes::triangles(&tri, 9), 16, 0);
+            leaf_boxes[band] = [x0 - 0.1, -1.1, z - 0.5, x1 + 0.1, 1.1, z + 0.5];
+        }
+        // Alternate box16 and box32 internal nodes.
+        let (node, dwords, kind) = if layer % 2 == 0 {
+            (nodes::box16(leaf_ptrs, leaf_boxes), 16, 4)
+        } else {
+            (nodes::box32(leaf_ptrs, leaf_boxes), 32, 5)
+        };
+        mid_ptrs[layer] = add(&mut words, node, dwords, kind);
+        mid_boxes[layer] = [-3.1, -1.1, z - 0.5, 3.1, 1.1, z + 0.5];
+    }
+    let root = nodes::box32(mid_ptrs, mid_boxes);
+    words[..28].copy_from_slice(&root);
+    (words, 5u32)
+}
+
+/// Lowers `native` for a 32-lane host with `VICTORY_LDS_PRIVATE` set to `enabled`.
+fn lower_wave32_with_private(
+    native: &NativeProgram,
+    enabled: bool,
+) -> (lower::Lowered, Vec<resource::RootIndexedView>, bool) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, native).expect("io");
+    let parts = lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    };
+    let is_private = super::lds_private::is_lane_private(&p, &st, native);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was_enabled = super::TEST_LANE_PRIVATE_LDS.replace(Some(enabled));
+    let lowered = lower::lower(&parts);
+    super::TEST_LANE_PRIVATE_LDS.set(was_enabled);
+    lower::TEST_HOST_WAVE.set(was);
+    (lowered.expect("lower"), res.root_indexed_views, is_private)
+}
+
+/// Builds ray records for `count` threads over [`synthetic_bvh_scene`]: mixes
+/// hits on all 4 triangles (including occluded front/back hits on `t0`/`t1`),
+/// misses beside the boxes, and back-facing hits.
+fn synthetic_traversal_rays(count: usize, root_ptr: u32) -> (Vec<u32>, Vec<crate::bvh::Ray>) {
+    use crate::bvh::Ray;
+    let templates = [
+        // Hits t0 (z=4, occludes t1 at z=8)
+        Ray::new([-2.0, 0.0, 0.0], [0.0, 0.0, 1.0], 100.0),
+        // Hits t2 (z=5, center)
+        Ray::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 100.0),
+        // Hits t3 (z=6, right)
+        Ray::new([2.0, 0.0, 0.0], [0.0, 0.0, 1.0], 100.0),
+        // Misses completely (outside all boxes)
+        Ray::new([5.0, 0.0, 0.0], [0.0, 0.0, 1.0], 100.0),
+        // Hits t1 from behind (z=10 looking -z, occludes t0 at z=4)
+        Ray::new([-2.0, 0.0, 10.0], [0.0, 0.0, -1.0], 100.0),
+        // Hits box of t2 but misses triangle t2 (corner of its AABB)
+        Ray::new([0.9, 0.9, 0.0], [0.0, 0.0, 1.0], 100.0),
+        // Short extent misses t3 (z=6)
+        Ray::new([2.0, 0.0, 0.0], [0.0, 0.0, 1.0], 5.0),
+        // Angled ray hitting t0 near vertex 1
+        Ray::new([-1.5, -0.5, 0.0], [0.0, 0.0, 1.0], 100.0),
+    ];
+    let mut records = vec![0u32; count * 16];
+    let mut rays = Vec::with_capacity(count);
+    for t in 0..count {
+        let base = templates[t % templates.len()];
+        // Tiny deterministic jitter that keeps hit/miss class distinct across lanes.
+        let jitter = ((t % 17) as f32 - 8.0) * 0.01;
+        let ray = Ray::new(
+            [base.origin[0] + jitter, base.origin[1] - jitter * 0.5, base.origin[2]],
+            base.direction,
+            base.extent,
+        );
+        let r = &mut records[t * 16..t * 16 + 16];
+        r[0] = root_ptr;
+        r[1] = 0;
+        r[2] = ray.extent.to_bits();
+        for a in 0..3 {
+            r[3 + a] = ray.origin[a].to_bits();
+            r[6 + a] = ray.direction[a].to_bits();
+            r[9 + a] = ray.inverse[a].to_bits();
+        }
+        rays.push(ray);
+    }
+    (records, rays)
+}
+
+/// A console wave64 multi-level BVH traversal shader with a per-thread SoA LDS
+/// stack inside a divergent traversal loop must lower cleanly and exactly to
+/// wave32 on 32-lane hardware (RTX 5070 Ti), without `loose_lds` approximation
+/// or `split_lds` group barriers, and match the CPU BVH traversal oracle bit
+/// for bit across hits, misses, and occluders.
+#[test]
+fn wave64_bvh_traversal_with_private_lds_stack_runs_on_wave32_without_barriers() {
+    let (bvh_words, root_ptr) = synthetic_bvh_scene();
+    let (records, rays) = synthetic_traversal_rays(64, root_ptr);
+    let steps = 8u32;
+
+    for (label, divergent, with_wave_op) in [
+        ("divergent_loop", true, false),
+        ("uniform_loop", false, false),
+        ("divergent_loop_with_wave_op", true, true),
+        ("uniform_loop_with_wave_op", false, true),
+    ] {
+        let native = wave64_bvh_traversal_program(divergent, with_wave_op);
+        // Confirm legacy behavior reproduces the failure / barrier overhead before our pass.
+        let (legacy, _, is_private) = lower_wave32_with_private(&native, false);
+        assert!(is_private, "{label}: expected lds_lane_private == true");
+        if divergent {
+            assert_eq!(
+                legacy.wave_size,
+                Some(64),
+                "{label}: legacy lowering without lds_lane_private should refuse wave32"
+            );
+        } else {
+            assert!(
+                legacy.barriers >= 6,
+                "{label}: legacy lowering should emit split_lds barriers (got {})",
+                legacy.barriers
+            );
+        }
+
+        let (lowered, root_indexed_views, _) = lower_wave32_with_private(&native, true);
+        if with_wave_op {
+            assert_eq!(
+                lowered.wave_size,
+                Some(32),
+                "{label}: cross-half wave op with private LDS must lower to WaveSize(32)"
+            );
+            if !divergent {
+                assert!(
+                    lowered.barriers < legacy.barriers,
+                    "{label}: private LDS must eliminate split_lds barriers ({} vs {})",
+                    lowered.barriers,
+                    legacy.barriers
+                );
+            }
+        } else {
+            assert_eq!(
+                lowered.wave_size, None,
+                "{label}: private LDS without wave ops must not force a WaveSize"
+            );
+            assert_eq!(
+                lowered.barriers, 0,
+                "{label}: private LDS without wave ops must emit zero dx.op.barrier calls"
+            );
+        }
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy)
+                .unwrap_or_else(|e| panic!("{label}: DXIL validation failed: {e}"));
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (dev_label, warp) in [("hardware", false), ("warp", true)] {
+            // WARP does not accept explicit `WaveSize(32)` pipelines (only `WaveSize(None)`).
+            if warp && lowered.wave_size.is_some() {
+                continue;
+            }
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            if !warp {
+                eprintln!("wave64_bvh_traversal ({label}) adapter: {:?}", host.adapter_name());
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}/{dev_label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(5) as usize];
+            ud[0] = steps;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            super::host::View::DeviceRawSrv(&records),
+                            View::RawUav(64 * 4),
+                            super::host::View::DeviceRawSrv(&bvh_words),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}/{dev_label}: dispatch failed: {e}"));
+            for t in 0..64usize {
+                let want = cpu_traverse(&bvh_words, root_ptr, &rays[t], steps);
+                let got = &out[0][4 * t..4 * t + 4];
+                assert_eq!(
+                    got, want,
+                    "{label}/{dev_label} thread {t}: got {got:x?} want {want:x?}"
+                );
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no SM 6.6 device available");
+    }
+}
+
+/// Builds a small wave64 shader with 2 KiB LDS and a divergent `s_and_saveexec_b64` +
+/// `s_cbranch_execz` branch around `body` (which uses LDS), then stores `v5` per thread.
+fn divergent_lds_probe(body: &[u32], threads: [u32; 3], rsrc2_extra: u32) -> NativeProgram {
+    let mut w = vec![
+        0x7D88_0080, // v_cmp_gt_u32 vcc, s0, v0 (v0 < s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | body.len() as u32, // s_cbranch_execz +body.len()
+    ];
+    w.extend_from_slice(body);
+    w.extend_from_slice(&[
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 1, // buffer_store_dword v5, v1, s[8:11], 0 offen
+    ]);
+    let mut prog = native(&w);
+    if let StageIo::Cs(cs) = &mut prog.io {
+        cs.threads = threads;
+        cs.rsrc2 |= (4 << 15) | rsrc2_extra; // 2 KiB LDS
+    }
+    prog
+}
+
+/// Positive tests for `lds_lane_private`: AoS per-thread slice stacks, 2D `[8, 8, 1]`
+/// groups with flattened thread IDs, SoA `(sp << 8) + (v0 << 2)`, and odd stride `v0 * 12`.
+#[test]
+fn lds_lane_private_accepts_soa_aos_and_2d_group_stacks() {
+    // 1. AoS per-thread 32-byte slice: addr = (v0 << 5) | ((s1 & 7) << 2)
+    let mut aos = vec![
+        0x3404_0085, // v_lshlrev_b32 v2, 5, v0
+        0x3606_0287, // v_and_b32 v3, 7, v1 (uninit/runtime index masked to 0..7)
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+        0x3804_0702, // v_or_b32 v2, v2, v3
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+    ];
+    aos.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    aos.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+    let aos_prog = divergent_lds_probe(&aos, [64, 1, 1], 0);
+    let (lowered, _, is_priv) = lower_wave32_with_private(&aos_prog, true);
+    assert!(is_priv, "AoS slice (v0 << 5) | ((sp & 7) << 2) must be lane-private");
+    assert_eq!(lowered.wave_size, None);
+    assert_eq!(lowered.barriers, 0);
+
+    // 2. 2D [8, 8, 1] group SoA stack: flat = (v1 << 3) | v0; addr = (flat << 2) + (s1 << 8)
+    let mut d2 = vec![
+        0x3404_0283, // v_lshlrev_b32 v2, 3, v1
+        0x3804_0102, // v_or_b32 v2, v2, v0 (flat = (v1 << 3) | v0)
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2 (flat << 2)
+        0x8F03_8801, // s_lshl_b32 s3, s1, 8
+        0x4A04_0403, // v_add_nc_u32 v2, s3, v2
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+    ];
+    d2.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    d2.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+    // rsrc2 bit 11 = TIDIG_COMP_CNT = 1 (v0 and v1 enabled)
+    let d2_prog = divergent_lds_probe(&d2, [8, 8, 1], 1 << 11);
+    let (lowered_2d, _, is_priv_2d) = lower_wave32_with_private(&d2_prog, true);
+    assert!(is_priv_2d, "2D [8, 8, 1] flattened SoA stack must be lane-private");
+    assert_eq!(lowered_2d.wave_size, None);
+    assert_eq!(lowered_2d.barriers, 0);
+
+    // 3. Odd-multiplied stride: addr = v0 * 12 (odd = 3, sh = 2, bijection mod 256)
+    let mut odd = vec![
+        0x1604_008C, // v_mul_u32_u24 v2, 12, v0
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+    ];
+    odd.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    odd.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+    let odd_prog = divergent_lds_probe(&odd, [64, 1, 1], 0);
+    let (lowered_odd, _, is_priv_odd) = lower_wave32_with_private(&odd_prog, true);
+    assert!(is_priv_odd, "odd stride v0 * 12 must be lane-private");
+    assert_eq!(lowered_odd.wave_size, None);
+    assert_eq!(lowered_odd.barriers, 0);
+}
+
+/// Negative soundness tests for `lds_lane_private`: every shared, aliasing, atomic,
+/// overlapping-offset, or unbounded-stride LDS pattern must be rejected (`false`)
+/// and keep `WaveSize(64)` when inside a divergent read+write branch.
+#[test]
+fn lds_lane_private_rejects_shared_and_unsafe_patterns() {
+    // 1. Constant address 0 (shared across all lanes)
+    let mut shared_const = vec![0x7E04_0280, 0x4A08_0081]; // v2 = 0, v4 = v0 + 1
+    shared_const.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    shared_const.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+
+    // 2. Cross-half alias: (v0 ^ 32) << 2 read alongside v0 << 2 write
+    let mut xor_alias = vec![
+        0x3404_0082, // v2 = v0 << 2
+        0x3A06_00A0, // v_xor_b32 v3, 32, v0
+        0x3406_0682, // v3 = (v0 ^ 32) << 2
+        0x4A08_0081,
+    ];
+    xor_alias.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    xor_alias.extend_from_slice(&ds(DS_READ_B32, 5, 3, 0));
+
+    // 3. 32-lane wrap alias: (v0 & 31) << 2 (lanes 0..31 collide with 32..63)
+    let mut mask31 = vec![
+        0x3604_009F, // v_and_b32 v2, 31, v0
+        0x3404_0482, // v2 <<= 2
+        0x4A08_0081,
+    ];
+    mask31.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    mask31.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+
+    // 4. Overlapping static offset: write at v0 << 2, read at (v0 << 2) + 4
+    let mut overlap_off = vec![0x3404_0082, 0x4A08_0081];
+    overlap_off.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    // ds_read_b32 v5, v2 offset:4
+    overlap_off.extend_from_slice(&[0x36 << 26 | (DS_READ_B32 as u32) << 18 | 4, (5 << 24) | 2]);
+
+    // 5. Mixed strides: write at v0 << 2, read at v0 << 3
+    let mut mixed_sh = vec![0x3404_0082, 0x3406_0083, 0x4A08_0081];
+    mixed_sh.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    mixed_sh.extend_from_slice(&ds(DS_READ_B32, 5, 3, 0));
+
+    // 6. AoS slice overflow: (v0 << 5) | ((v1 & 15) << 2) -> max 60 + 4 = 64 > 32
+    let mut aos_overflow = vec![
+        0x3404_0085, // v2 = v0 << 5
+        0x3606_028F, // v3 = v1 & 15
+        0x3406_0682, // v3 <<= 2
+        0x3804_0702, // v2 |= v3
+        0x4A08_0081,
+    ];
+    aos_overflow.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    aos_overflow.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+
+    // 7. LDS atomic (ds_add_u32 op = 0x00) even at v0 << 2
+    let mut atomic = vec![0x3404_0082, 0x4A08_0081];
+    atomic.extend_from_slice(&ds(0x00, 0, 2, 4)); // ds_add_u32 v2, v4
+    atomic.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+
+    // 8. 2D [8, 8, 1] group using only v0 << 2 (thread (0,0) collides with (0,1))
+    let mut d2_bad = vec![0x3404_0082, 0x4A08_0081];
+    d2_bad.extend_from_slice(&ds(DS_WRITE_B32, 0, 2, 4));
+    d2_bad.extend_from_slice(&ds(DS_READ_B32, 5, 2, 0));
+
+    let cases: [(&str, NativeProgram); 8] = [
+        ("shared_const", divergent_lds_probe(&shared_const, [64, 1, 1], 0)),
+        ("xor_half_alias", divergent_lds_probe(&xor_alias, [64, 1, 1], 0)),
+        ("mask31_alias", divergent_lds_probe(&mask31, [64, 1, 1], 0)),
+        ("overlap_offset4", divergent_lds_probe(&overlap_off, [64, 1, 1], 0)),
+        ("mixed_shift", divergent_lds_probe(&mixed_sh, [64, 1, 1], 0)),
+        ("aos_overflow", divergent_lds_probe(&aos_overflow, [64, 1, 1], 0)),
+        ("ds_atomic", divergent_lds_probe(&atomic, [64, 1, 1], 0)),
+        ("2d_v0_only", divergent_lds_probe(&d2_bad, [8, 8, 1], 1 << 11)),
+    ];
+    for (name, prog) in cases {
+        let (lowered, _, is_priv) = lower_wave32_with_private(&prog, true);
+        assert!(!is_priv, "{name}: unsafe LDS pattern must be rejected by lds_lane_private");
+        assert_eq!(
+            lowered.wave_size,
+            Some(64),
+            "{name}: rejected divergent LDS program must keep WaveSize(64)"
+        );
+    }
+}
+
+/// GPU timestamp benchmark comparing wave64 BVH traversal with a per-thread SoA
+/// LDS stack on the hardware GPU (1,048,576 rays x 32 steps over a 4-level
+/// synthetic BVH, verified bit-for-bit against [`cpu_traverse`]).
+///
+/// Compares:
+/// - `uniform_no_waveop`: legacy (`split_lds` + `halves` + `WaveSize(32)`) vs
+///   private-LDS (`WaveSize(None)`, zero barriers, zero `halves` atomic).
+/// - `uniform_with_waveop`: legacy vs private-LDS with `console_lanes = true`
+///   (isolates `split_lds` barrier removal while keeping `halves` + `exchange`).
+/// - `divergent_no_waveop`: private-LDS early-exit divergent traversal (refused
+///   with `WaveSize(64)` on legacy lowering).
+#[test]
+#[ignore]
+fn bench_wave64_bvh_traversal_lds_stack_on_gpu() {
+    const GROUPS: u32 = 16384;
+    const TOTAL_THREADS: usize = (GROUPS * 64) as usize;
+    const STEPS: u32 = 32;
+
+    let (bvh_words, root_ptr) = synthetic_bvh_scene_deep();
+    let (records, rays) = synthetic_traversal_rays(TOTAL_THREADS, root_ptr);
+    let expected: Vec<[u32; 4]> = (0..128)
+        .map(|t| cpu_traverse(&bvh_words, root_ptr, &rays[t], STEPS))
+        .collect();
+
+    let cases: [(&str, bool, bool, bool); 5] = [
+        ("uniform_no_waveop_legacy", false, false, false),
+        ("uniform_no_waveop_private", false, false, true),
+        ("uniform_with_waveop_legacy", false, true, false),
+        ("uniform_with_waveop_private", false, true, true),
+        ("divergent_no_waveop_private", true, false, true),
+    ];
+
+    let mut prepared = Vec::new();
+    for (label, divergent, with_wave_op, enable_private) in cases {
+        let native = wave64_bvh_traversal_program(divergent, with_wave_op);
+        let (lowered, root_indexed_views, _) = lower_wave32_with_private(&native, enable_private);
+        let barriers = lowered.barriers;
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views,
+        };
+        prepared.push((label, lowered.wave_size, barriers, shader));
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("SM 6.6 hardware GPU required");
+    let adapter = host.adapter_name().unwrap_or_else(|| "unknown".into());
+    eprintln!("WAVE64-LDS-BENCH adapter={adapter} groups={GROUPS} rays={TOTAL_THREADS} steps={STEPS}");
+
+    for (label, wave_size, barriers, shader) in &prepared {
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(5) as usize];
+        ud[0] = STEPS;
+        let (out, mut times_ms) = host
+            .dispatch_timed(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        super::host::View::DeviceRawSrv(&records),
+                        View::RawUav((TOTAL_THREADS * 4) as u32),
+                        super::host::View::DeviceRawSrv(&bvh_words),
+                    ],
+                    samplers: &[],
+                    groups: [GROUPS, 1, 1],
+                },
+                10,
+                40,
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch_timed failed: {e}"));
+
+        for (t, want) in expected.iter().enumerate() {
+            let got = &out[0][4 * t..4 * t + 4];
+            assert_eq!(got, want, "{label}: bit mismatch at thread {t}");
+        }
+        times_ms.sort_by(|a, b| a.total_cmp(b));
+        let median = times_ms[times_ms.len() / 2];
+        let p95 = times_ms[(times_ms.len() * 95 / 100).min(times_ms.len() - 1)];
+        let min = times_ms[0];
+        let mean = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
+        eprintln!(
+            "  {label:30} wave={wave_size:?} barriers={barriers:<2} dxil={:5}B | median {median:.4} ms | p95 {p95:.4} ms | min {min:.4} ms | mean {mean:.4} ms",
+            shader.dxil.len()
+        );
+    }
+}

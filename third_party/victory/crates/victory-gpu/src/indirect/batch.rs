@@ -261,6 +261,10 @@ impl Table {
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
+/// Records the pass over the table at `jobs` (a host address) into `dst`,
+/// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
+/// earlier shader write (the title's argument passes), before what reads
+/// the clamped records.
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -269,18 +273,35 @@ pub(super) fn record(
     sources: [u64; SOURCES],
     jobs: u64,
 ) {
+    record_with_uav(c, l, (dst, before), budget, sources, jobs, true);
+}
+
+/// As [`record`], omitting the pre-clamp global UAV barrier when the caller
+/// already knows a global UAV barrier has been recorded with no intervening
+/// GPU work (`Rec::is_uav_synced`).
+pub(super) fn record_with_uav(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    sources: [u64; SOURCES],
+    jobs: u64,
+    need_pre_uav: bool,
+) {
     let after = transition(
         dst,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
     );
+    let pre = [
+        uav_barrier(),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    ];
+    let skip = usize::from(!need_pre_uav);
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        l.ResourceBarrier(&pre[skip..]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {

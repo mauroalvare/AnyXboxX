@@ -2128,7 +2128,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
+/// answer is none without a look at the pages between (one query for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -2147,67 +2147,123 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
-    if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
-            // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
-            return (there as u64 * 4096).min(len as u64);
+    if by_query() {
+        if !committed_by_query(at, 1) && !committed_by_query((end - 1) as *const u8, 1) {
+            return 0;
         }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        return mapped_texture_blocks(start, end);
-    }
-    let (mut p, mut there) = (start, 0u64);
-    while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
-        if n == 0 || next <= p {
-            break;
+        let (mut p, mut there) = (start, 0u64);
+        while p < end {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+            if n == 0 || next <= p {
+                break;
+            }
+            if info.State == MEM_COMMIT {
+                there += (next - p) as u64;
+            }
+            p = next;
         }
-        if info.State == MEM_COMMIT {
-            there += (next - p) as u64;
-        }
-        p = next;
+        return there;
     }
-    there
+    static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+            return 0;
+        }
+        let (there, _) = readable(start, len, false);
+        return (there as u64 * 4096).min(len as u64);
+    }
+    mapped_texture_blocks(start, end)
 }
 
-/// Counts readable blocks where the runtime has no mapping record. Query
-/// the extent of a hole only after its first failed read.
+/// Counts readable 64 KiB blocks where the runtime has no mapping record.
+/// A batch asks about up to 16 MiB. A failed read can skip the rest of a hole.
 fn mapped_texture_blocks(start: usize, end: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
-    const BLOCK: usize = 64 << 10;
-    let mut there = 0u64;
-    let mut block = start & !(BLOCK - 1);
-    while block < end {
-        let next = block.saturating_add(BLOCK);
-        let lo = block.max(start);
-        block = next;
-        if readable(lo, 1, true).0 == 1 {
-            there += (next.min(end) - lo) as u64;
-            continue;
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if start >= end {
+        return 0;
+    }
+    const KERNEL_PAGE: usize = 4096;
+    // SAFETY: pseudo-handle for our own process.
+    let process = unsafe { GetCurrentProcess() };
+    let first_page = start & !(KERNEL_PAGE - 1);
+    let last_page = (end - 1) & !(KERNEL_PAGE - 1);
+    // Query the first and last pages in one `QueryWorkingSetEx` call so
+    // unmapped ("away") slots and single-block textures take a single query.
+    // SAFETY: plain data.
+    let mut ends: [PSAPI_WORKING_SET_EX_INFORMATION; 2] = unsafe { std::mem::zeroed() };
+    ends[0].VirtualAddress = first_page as *mut _;
+    let end_count = if last_page == first_page {
+        1
+    } else {
+        ends[1].VirtualAddress = last_page as *mut _;
+        2
+    };
+    // SAFETY: `end_count` entries of the size given; our own process.
+    let asked = unsafe {
+        K32QueryWorkingSetEx(
+            process,
+            ends.as_mut_ptr().cast(),
+            (end_count * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        )
+    } != 0;
+    // SAFETY: plain data the query filled in.
+    let valid0 = asked && unsafe { ends[0].VirtualAttributes.Flags } & 1 != 0;
+    let mut byte = [0u8];
+    let first_ok = valid0 || crate::host::read_into(first_page as *const u8, &mut byte);
+    if !first_ok {
+        // SAFETY: plain data the query filled in (only read when `end_count == 2`).
+        let last_ok = end_count == 2
+            && ((asked && unsafe { ends[1].VirtualAttributes.Flags } & 1 != 0)
+                || crate::host::read_into(last_page as *const u8, &mut byte));
+        if !last_ok {
+            return 0;
         }
-        // SAFETY: queries an address and fills a structure of the right size.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let queried = unsafe { VirtualQuery(lo as *const _, &mut info, size_of_val(&info)) };
-        if queried != 0 && (info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0) {
-            let hole_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
-            block = block.max(hole_end.checked_next_multiple_of(BLOCK).unwrap_or(end));
+    }
+    const BLOCK: usize = 64 << 10;
+    let mut block = (start & !(BLOCK - 1)).saturating_add(BLOCK);
+    let mut there = if first_ok { (block.min(end) - start) as u64 } else { 0 };
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut hole_end = 0;
+    while block < end {
+        let mut n = 0;
+        while block < end && n < info.len() {
+            info[n].VirtualAddress = block as *mut _;
+            info[n].VirtualAttributes.Flags = 0;
+            block = block.saturating_add(BLOCK);
+            n += 1;
+        }
+        let batch = &mut info[..n];
+        // SAFETY: the query has the size of this slice and refers to our process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(process, batch.as_mut_ptr().cast(), size_of_val(batch) as u32)
+        } != 0;
+        for entry in batch {
+            let at = entry.VirtualAddress as usize;
+            if at < hole_end {
+                continue;
+            }
+            // SAFETY: plain data filled by the query.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            if valid || crate::host::read_into(at as *const u8, &mut byte) {
+                there += (at.saturating_add(BLOCK).min(end) - at) as u64;
+                continue;
+            }
+            // SAFETY: queries an address using a structure of the right size.
+            let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let queried = unsafe { VirtualQuery(at as *const _, &mut region, size_of_val(&region)) };
+            if queried != 0 && (region.State != MEM_COMMIT || region.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0) {
+                hole_end = (region.BaseAddress as usize).saturating_add(region.RegionSize).min(end);
+                block = block.max(hole_end.checked_next_multiple_of(BLOCK).unwrap_or(end));
+            }
         }
     }
     there
@@ -2815,6 +2871,185 @@ mod allocation_costs {
             };
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
+        }
+    }
+}
+
+#[cfg(test)]
+mod mapped_bytes_tests {
+    use std::time::Instant;
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    use super::*;
+
+    const BLOCK: usize = 64 << 10;
+
+    fn oracle_block_bytes(start: usize, len: usize, block_mapped: impl Fn(usize) -> bool) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        let end = start.saturating_add(len);
+        let mut there = 0u64;
+        let mut block = start & !(BLOCK - 1);
+        while block < end {
+            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+            if block_mapped(lo) {
+                there += (hi - lo) as u64;
+            }
+            block = block.saturating_add(BLOCK);
+        }
+        there
+    }
+
+    #[test]
+    fn mapped_bytes_matches_block_oracle_across_layouts() {
+        const BLOCKS: usize = 320; // 20 MiB (> 256 blocks: crosses multiple 256-entry batches)
+        const TOTAL: usize = BLOCKS * BLOCK;
+        // SAFETY: isolated reservation owned by this test and released before return.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>() };
+        assert!(!base.is_null(), "VirtualAlloc reserve failed");
+
+        let commit = |first_block: usize, count: usize, touch: bool| unsafe {
+            let ptr = base.add(first_block * BLOCK);
+            let bytes = count * BLOCK;
+            let got = VirtualAlloc(ptr.cast(), bytes, MEM_COMMIT, PAGE_READWRITE);
+            assert_eq!(got, ptr.cast(), "VirtualAlloc commit failed");
+            if touch {
+                for b in 0..count {
+                    ptr.add(b * BLOCK).write((b & 0xff) as u8);
+                }
+            }
+        };
+        let decommit = |first_block: usize, count: usize| unsafe {
+            let ptr = base.add(first_block * BLOCK);
+            assert_ne!(VirtualFree(ptr.cast(), count * BLOCK, MEM_DECOMMIT), 0, "VirtualFree decommit failed");
+        };
+
+        // 1. Zero-length and completely unmapped spans (sub-page, 1 block, 4 MiB, 20 MiB).
+        assert_eq!(mapped_bytes(base, 0), 0);
+        assert_eq!(mapped_bytes(base, 128), 0);
+        assert_eq!(mapped_bytes(base, BLOCK), 0);
+        assert_eq!(mapped_bytes(base, 4 << 20), 0);
+        assert_eq!(mapped_bytes(base, TOTAL), 0);
+
+        // 2. Committed-but-untouched pages (not yet in the working set -> read_into fallback).
+        commit(0, 6, false);
+        assert_eq!(mapped_bytes(base, 6 * BLOCK), (6 * BLOCK) as u64);
+        assert_eq!(mapped_bytes(base, 12 * BLOCK), (6 * BLOCK) as u64);
+
+        // 3. Single block and sub-page ranges when mapped.
+        commit(0, 6, true);
+        assert_eq!(mapped_bytes(base, 128), 128);
+        assert_eq!(mapped_bytes(base, 4096), 4096);
+        assert_eq!(mapped_bytes(base, BLOCK), BLOCK as u64);
+
+        // 4. Unaligned start and unaligned end spanning committed + uncommitted blocks.
+        let unaligned_start = 12_345usize;
+        let unaligned_len = 8 * BLOCK + 7_777;
+        let expected = oracle_block_bytes(base as usize + unaligned_start, unaligned_len, |lo| {
+            let idx = (lo - base as usize) / BLOCK;
+            idx < 6
+        });
+        assert_eq!(unsafe { mapped_bytes(base.add(unaligned_start), unaligned_len) }, expected);
+
+        // 5. Middle hole + >256 blocks (20 MiB): blocks [0..96) and [200..320) committed.
+        commit(6, 90, true); // [0..96)
+        commit(200, 120, true); // [200..320)
+        assert_eq!(mapped_bytes(base, TOTAL), ((96 + 120) * BLOCK) as u64);
+
+        // 6. Unmapped start, mapped tail: [96..200) unmapped, [200..208) mapped.
+        let tail_start = unsafe { base.add(96 * BLOCK) };
+        let tail_span = (208 - 96) * BLOCK;
+        assert_eq!(mapped_bytes(tail_start, tail_span), (8 * BLOCK) as u64);
+
+        // 7. Edge case: single 64 KiB block where first 4 KiB page is uncommitted, last 4 KiB page IS committed.
+        // Fast check sees last page committed, then block probe checks block start page (uncommitted) -> 0.
+        decommit(100, 1);
+        unsafe {
+            let last_page = base.add(100 * BLOCK + BLOCK - 4096);
+            assert_eq!(VirtualAlloc(last_page.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), last_page.cast());
+            last_page.write(0x5a);
+            assert_eq!(mapped_bytes(base.add(100 * BLOCK), BLOCK), 0);
+            assert_ne!(VirtualFree(last_page.cast(), 4096, MEM_DECOMMIT), 0);
+        }
+
+        // SAFETY: releases the reservation allocated above.
+        unsafe {
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn mapped_bytes_streaming_sweep_benchmark() {
+        const MB: usize = 1 << 20;
+        const SWEEPS: usize = 10;
+
+        // Allocate distinct synthetic backing regions for each residency class:
+        // - 16 MiB fully resident (touched)
+        // - 4 MiB fully resident (touched)
+        // - 4 MiB half resident (2 MiB committed + touched, 2 MiB reserved)
+        // - 4 MiB unmapped ("away" slot)
+        // - 64 KiB fully resident (1 block)
+        let alloc_region = |total: usize, commit_bytes: usize| -> *mut u8 {
+            // SAFETY: isolated test reservation.
+            unsafe {
+                let p = VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!p.is_null());
+                if commit_bytes > 0 {
+                    assert_eq!(VirtualAlloc(p.cast(), commit_bytes, MEM_COMMIT, PAGE_READWRITE), p.cast());
+                    let mut off = 0;
+                    while off < commit_bytes {
+                        p.add(off).write(((off >> 12) & 0xff) as u8);
+                        off += 4096;
+                    }
+                }
+                p
+            }
+        };
+
+        let r_16m_full = alloc_region(16 * MB, 16 * MB);
+        let r_4m_full = alloc_region(4 * MB, 4 * MB);
+        let r_4m_half = alloc_region(4 * MB, 2 * MB);
+        let r_4m_away = alloc_region(4 * MB, 0);
+        let r_64k_full = alloc_region(BLOCK, BLOCK);
+
+        let run_category = |ptr: *const u8, len: usize, count: usize, expected_each: u64| -> (f64, u64) {
+            // Warmup once.
+            assert_eq!(mapped_bytes(ptr, len), expected_each);
+            let t0 = Instant::now();
+            let mut sum = 0u64;
+            for _ in 0..SWEEPS {
+                for _ in 0..count {
+                    sum += std::hint::black_box(mapped_bytes(std::hint::black_box(ptr), std::hint::black_box(len)));
+                }
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(sum, expected_each * (count as u64) * (SWEEPS as u64));
+            (ms, sum)
+        };
+
+        let (ms_16m_full, _) = run_category(r_16m_full, 16 * MB, 100, (16 * MB) as u64);
+        let (ms_4m_full, _) = run_category(r_4m_full, 4 * MB, 400, (4 * MB) as u64);
+        let (ms_4m_half, _) = run_category(r_4m_half, 4 * MB, 400, (2 * MB) as u64);
+        let (ms_4m_away, _) = run_category(r_4m_away, 4 * MB, 1600, 0);
+        let (ms_64k_full, _) = run_category(r_64k_full, BLOCK, 400, BLOCK as u64);
+        let total_ms = ms_16m_full + ms_4m_full + ms_4m_half + ms_4m_away + ms_64k_full;
+
+        eprintln!(
+            "mapped_bytes_bench ({SWEEPS} sweeps x 2900 slots): total={total_ms:.2}ms \
+             [16MiB_full(100)={ms_16m_full:.2}ms 4MiB_full(400)={ms_4m_full:.2}ms \
+             4MiB_half(400)={ms_4m_half:.2}ms 4MiB_away(1600)={ms_4m_away:.2}ms \
+             64KiB_full(400)={ms_64k_full:.2}ms]"
+        );
+
+        // SAFETY: release all test reservations.
+        unsafe {
+            for p in [r_16m_full, r_4m_full, r_4m_half, r_4m_away, r_64k_full] {
+                assert_ne!(VirtualFree(p.cast(), 0, MEM_RELEASE), 0);
+            }
         }
     }
 }

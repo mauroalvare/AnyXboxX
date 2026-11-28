@@ -648,7 +648,7 @@ fn take_card_room(counter: &AtomicU64, len: u64, most: u64) -> bool {
 }
 
 /// Local-VRAM buffer breakdown for the HUD: `[card_buffers_and_windows, bvh_arenas]`.
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn vram_breakdown() -> [u64; 2] {
     let bvh = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
     let win = WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_sub(bvh);
@@ -3079,6 +3079,12 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
     runs
 }
 
+/// Dword-aligned `(offset, len)` ranges where `title` differs from `held`
+/// (AVX2-accelerated when aligned and supported).
+pub(crate) fn word_diff_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    word_runs(at, title, held)
+}
+
 /// [`dword_runs`] with no gap, the fast way where it can be: a frame compares
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
@@ -5440,9 +5446,21 @@ impl Shadow {
         self.changes_only.store(true, Ordering::Relaxed);
     }
 
-    /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
-    pub(crate) fn resend(&self, from: usize, to: usize) {
+    /// Mutable pointer to the CPU-cached staging/backing memory (`L0 WRITE_BACK`).
+    pub(crate) fn data_mut(&self) -> *mut u8 {
+        self.data
+    }
+
+    /// Marks byte offsets `[from, to)` dirty on the card's side directly (for
+    /// owned by-address buffers written straight into `data_mut()`).
+    pub(crate) fn mark_card_dirty(&self, from: usize, to: usize) {
         self.card_changed(from, to);
+    }
+
+    /// Marks a sequence of byte offset ranges `(from, to)` dirty on the card's
+    /// side directly.
+    pub(crate) fn mark_card_dirty_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        self.card_changed_runs(runs);
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -6600,6 +6618,10 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
+    by_address_copy(host, start, len, true)
+}
+
+fn by_address_copy(host: &crate::host::Host, start: u64, len: u64, use_card: bool) -> Option<Arc<Shadow>> {
     // At most so much on the card's own memory (4 GiB unless
     // `VICTORY_MEMORY_CARD_MB` says otherwise) of copies alive, and while it
     // has room; past that the side shaders see is in the PC's memory.
@@ -6608,7 +6630,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let room = use_card && host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && take_card_room(&BY_ADDRESS_CARD_BYTES, len, most) {
         let made = host.uav_buffer(len);
@@ -6624,10 +6646,6 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
     };
-    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
-    // (Counted down with the windows' on the card when it goes.)
-    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
@@ -6644,8 +6662,18 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    if shadow.card.is_some() {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    }
     Some(shadow)
+}
+
+/// An owned buffer for [`crate::memory`]'s directory and arenas. The caller
+/// writes to the staging mapping directly and marks the changed ranges for
+/// upload in submission order.
+pub(crate) fn by_address_owned(len: u64) -> Option<Arc<Shadow>> {
+    let host = host()?;
+    by_address_copy(host, 0, len, cards() && host.card_ready())
 }
 
 type LooseTable = BTreeMap<(u64, u64), Arc<Shadow>>;

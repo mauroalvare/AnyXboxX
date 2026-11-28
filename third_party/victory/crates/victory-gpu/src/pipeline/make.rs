@@ -57,35 +57,59 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeftOutPolicy {
+    skip_rt_resolve: bool,
+    skip_activate_rays: bool,
+}
+
+impl LeftOutPolicy {
+    fn from_values(builder: bool, rt_resolve: Option<&str>, activate_rays: Option<&str>) -> Self {
+        let skip_rt_resolve = match rt_resolve {
+            Some("0") => true,
+            Some(_) => false,
+            None => !builder,
+        };
+        let skip_activate_rays = match activate_rays {
+            Some("0") => true,
+            Some(_) => false,
+            // Enable ray activation whenever either the BVH builder or RT resolve
+            // is enabled, unless explicitly disabled with VICTORY_ACTIVATE_RAYS=0.
+            None => !(builder || !skip_rt_resolve),
+        };
+        Self {
+            skip_rt_resolve,
+            skip_activate_rays,
+        }
+    }
+
+    fn from_env() -> Self {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let rt_resolve = std::env::var("VICTORY_RT_RESOLVE").ok();
+        let activate_rays = std::env::var("VICTORY_ACTIVATE_RAYS").ok();
+        Self::from_values(builder, rt_resolve.as_deref(), activate_rays.as_deref())
+    }
+
+    fn check(self, is_resolve: bool, is_activate: bool) -> Option<&'static str> {
+        if self.skip_rt_resolve && is_resolve {
+            return Some("shades ray-tracing hits without BVH, left out");
+        }
+        if self.skip_activate_rays && is_activate {
+            return Some("ray activation shader without BVH, left out");
+        }
+        None
+    }
+}
+
 fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
-    });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
-    }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
-    }
-    if super::skipped_in_list(shaders, skip_hashes).is_some() {
-        return Some("skipped by VICTORY_SKIP_PIPELINES");
-    }
-    None
+    static POLICY: OnceLock<LeftOutPolicy> = OnceLock::new();
+    let policy = *POLICY.get_or_init(LeftOutPolicy::from_env);
+    policy.check(
+        named(shaders, b"CS_RaytracingResolve"),
+        named(shaders, b"CS_ScreenProbes_ActivateRays"),
+    )
+    .or_else(|| super::skipped_in_list(shaders, skip_hashes)
+        .map(|_| "skipped by VICTORY_SKIP_PIPELINES"))
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -199,7 +223,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some(p.left_out.unwrap_or("being made").into()),
+        None => Some("being made".into()),
         Some(None) => {
             let rejected = unsupported_stages(p.shaders.iter().map(|s| s.stage), p.graphics.is_some());
             if let Some(reason) = rejected.filter(|reason| *reason != "graphics state not kept (plain description)") {
@@ -292,6 +316,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Queues `p` at `REQUESTED` priority on the pipeline worker pool if it is not
+/// built or queued yet, without blocking.
+pub(crate) fn enqueue_requested(p: &Arc<Pending>) {
+    if p.left_out.is_none() && p.made.get().is_none() {
+        start(p, REQUESTED);
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -646,10 +678,12 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn missing_distinguishes_omitted_and_pending_pipelines() {
-        let reason = "ray activation shader without BVH, left out";
         let mut omitted = Pending::new(Vec::new(), None);
-        omitted.left_out = Some(reason);
-        assert_eq!(missing(&omitted).as_deref(), Some(reason));
+        omitted.left_out = Some("ray activation shader without BVH, left out");
+        assert_eq!(
+            missing(&omitted).as_deref(),
+            Some("intentionally omitted: ray activation shader without BVH, left out")
+        );
 
         let pending = Pending::new(Vec::new(), None);
         pending.queue_state.store(MAKING, Ordering::Relaxed);
@@ -785,7 +819,7 @@ mod tests {
         #[cfg(feature = "diagnostics")]
         assert_eq!(
             missing(&skipped).as_deref(),
-            Some("skipped by VICTORY_SKIP_PIPELINES")
+            Some("intentionally omitted: skipped by VICTORY_SKIP_PIPELINES")
         );
 
         let normal = Arc::new(Pending::new_with_skip_hashes(
@@ -802,4 +836,38 @@ mod tests {
         }
         assert!(matches!(normal.made.get(), Some(None)));
     }
+
+    #[test]
+    fn rt_pass_left_out_policy_keeps_activation_and_resolve_consistent() {
+        // Default (no BVH builder, no overrides): both passes skipped.
+        let default = LeftOutPolicy::from_values(false, None, None);
+        assert!(default.check(true, false).is_some());
+        assert!(default.check(false, true).is_some());
+        assert_eq!(default.check(false, false), None);
+
+        // VICTORY_RT_RESOLVE=1 without builder must also enable ray activation
+        // so screen-probe rays are actually launched.
+        let resolve_only = LeftOutPolicy::from_values(false, Some("1"), None);
+        assert_eq!(resolve_only.check(true, false), None);
+        assert_eq!(resolve_only.check(false, true), None);
+
+        // Explicit VICTORY_ACTIVATE_RAYS=0 still overrides VICTORY_RT_RESOLVE=1.
+        let resolve_no_activate = LeftOutPolicy::from_values(false, Some("1"), Some("0"));
+        assert_eq!(resolve_no_activate.check(true, false), None);
+        assert!(resolve_no_activate.check(false, true).is_some());
+
+        // VICTORY_BVH_BUILDER=1 enables both, while honoring explicit =0 overrides.
+        let builder = LeftOutPolicy::from_values(true, None, None);
+        assert_eq!(builder.check(true, false), None);
+        assert_eq!(builder.check(false, true), None);
+
+        let builder_no_resolve = LeftOutPolicy::from_values(true, Some("0"), None);
+        assert!(builder_no_resolve.check(true, false).is_some());
+        assert_eq!(builder_no_resolve.check(false, true), None);
+
+        let builder_no_activate = LeftOutPolicy::from_values(true, None, Some("0"));
+        assert_eq!(builder_no_activate.check(true, false), None);
+        assert!(builder_no_activate.check(false, true).is_some());
+    }
+
 }

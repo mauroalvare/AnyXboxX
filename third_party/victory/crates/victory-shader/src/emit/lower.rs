@@ -77,6 +77,9 @@ pub(crate) struct Lowered {
     /// Whether the pixel program declares early depth-stencil.
     #[cfg(test)]
     pub early_depth: bool,
+    /// `dx.op.barrier` calls emitted in this shader.
+    #[cfg(test)]
+    pub barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2045,6 +2048,12 @@ impl<'a> Lower<'a> {
                     console_lanes |= first_lane_crosses;
                 }
             }
+            let lds_private = wave == 64
+                && host_max_wave() == 32
+                && s.lds_dwords > 0
+                && super::lane_private_lds_enabled()
+                && super::lds_private::is_lane_private(p, x.st, x.native);
+            let shared_lds = s.lds_dwords > 0 && !lds_private;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, `ds_bpermute`, which the ISA
@@ -2052,8 +2061,8 @@ impl<'a> Lower<'a> {
             // host wave one half of a console wave (lanes 32k..32k+31). Not when it crosses
             // halves (`v_mbcnt`, `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or
             // lane-constant masks), nor when LDS may be shared within the console wave without
-            // barriers (a group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            // barriers (a group over 32 threads with shared LDS): those still need 64-lane waves.
+            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && shared_lds) {
                 let crosses = first_lane_crosses || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -2062,7 +2071,7 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                if !crosses && (!shared_lds || group <= 32) {
                     wave = 32;
                 } else {
                     // (Groups of several console waves too: each console wave is two host
@@ -2081,7 +2090,7 @@ impl<'a> Lower<'a> {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
+                        let mut lds_ok = !(shared_lds && group > 32) || ok;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
@@ -2097,7 +2106,7 @@ impl<'a> Lower<'a> {
                         }
                         if lds_ok {
                             wave = 32;
-                            split_lds = s.lds_dwords > 0 && group > 32;
+                            split_lds = shared_lds && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
@@ -2132,7 +2141,7 @@ impl<'a> Lower<'a> {
                     if lane_constant_masks(x.st) {
                         why.push("lane-constant mask");
                     }
-                    if s.lds_dwords > 0 && group > 32 {
+                    if shared_lds && group > 32 {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks_with_loop_exits(x.st, loop_exits_on()) {
                             None => why.push("an indirect exit"),
@@ -2143,7 +2152,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", shared_lds, why.join(", "));
                 }
             }
             if wave == 32 && x.native.wave64 {
@@ -2158,7 +2167,7 @@ impl<'a> Lower<'a> {
                 ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || one_wave && shared_lds {
                 s.wave_size = Some(wave);
             }
         }
@@ -3111,6 +3120,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            barriers: self.s.barriers,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3866,9 +3877,14 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        let (k16, k8) = (k(self, 16), k(self, 0xFF));
+        let (k16, max_hi) = (k(self, 16), k(self, MEMORY_PAGES >> 16));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
-        let high = self.s.m.bin(c, Bin::And, hi, k8);
+        // Clamp `hi` before shifting so addresses at or above 2^40 (1 TiB,
+        // e.g. `hi = 0x100`) never wrap back into mapped pages below 128 GiB.
+        let high = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[hi, max_hi]);
+        self.s.m.tag(high, Tag::Clamp);
         let high = self.s.m.bin(c, Bin::Shl, high, k16);
         let page = self.s.m.bin(c, Bin::Or, low, high);
         // Inside the directory whatever the address (lanes that do not run
@@ -3903,6 +3919,7 @@ impl<'a> Lower<'a> {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
         let places = k(self, MEMORY_FAULTS - 1);
+        // Out-of-range addresses log the clamped sentinel page.
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;

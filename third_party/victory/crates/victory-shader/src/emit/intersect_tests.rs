@@ -673,7 +673,7 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         assert_eq!(
             res.bvh[0].1,
             BvhNodes::Memory {
-                word1: 0x8000_0000,
+                box_sort: Some(true),
                 word3: 0x8900_03ff
             }
         );
@@ -1907,4 +1907,461 @@ fn bench_bvh64_intersect_on_gpu() {
             faults.len()
         );
     }
+}
+
+/// Tests `image_bvh_intersect_ray` when descriptor dword 1 (`word1`) is computed
+/// at runtime rather than a compile-time constant:
+/// 1. Static `BOX_SORT` via `s_or_b32` with a dynamic 48-bit base address past 4 GiB.
+/// 2. Fully dynamic `word1 = s1`, toggling `BOX_SORT` 0 vs 1 on the exact same
+///    compiled pipeline over the real `SLOT_MEMORY` directory.
+/// 3. End-to-end picked heap view (`SLOT_STRIDES` / `VIEW_ADDRESSES`) whose
+///    64-bit title address builds `(word0, word1 | BOX_SORT)` for
+///    `image_bvh_intersect_ray` over `SLOT_MEMORY`.
+#[test]
+fn dynamic_bvh_descriptor_word1_and_picked_view_address_match_reference_on_gpu() {
+    use super::{SLOT_STRIDES, SLOT_STRIDES_BYTES, VIEW_ADDRESSES};
+    const PAGE_BYTES: usize = 1 << 16;
+
+    // Box32 with children ordered farthest-first so sorted vs unsorted results differ.
+    let children = [0x105u32, 0x20cu32, 0x304u32, bvh::NONE];
+    let bounds = [
+        [29.0, -1.0, -1.0, 31.0, 1.0, 1.0], // x=29 (farthest)
+        [19.0, -1.0, -1.0, 21.0, 1.0, 1.0], // x=19 (mid)
+        [9.0, -1.0, -1.0, 11.0, 1.0, 1.0],  // x=9 (nearest)
+        [f32::NAN; 6],
+    ];
+    let box_node = nodes::box32(children, bounds);
+    let tri_node = nodes::triangles(&[[5.0, 0.0, 2.0], [5.0, 2.0, -2.0], [5.0, -2.0, -2.0]], 9);
+
+    let mut arena = vec![0u32; PAGE_BYTES / 4];
+    arena[..28].copy_from_slice(&box_node);
+    arena[32..48].copy_from_slice(&tri_node[..16]);
+
+    // Map structure at title address 0x1_0025_0000 (past 4 GiB -> page 0x1_0025).
+    const BASE_ADDR: u64 = 0x1_0025_0000;
+    const BASE_PAGE: u32 = (BASE_ADDR >> 16) as u32;
+    let directory = make_directory(super::MEMORY_PAGES, &[(BASE_PAGE, 1, 0, false)]);
+
+    let ray_hit = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+    let ray_miss = Ray::new([0.0, 5.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+    let entries: Vec<(bool, u64, Ray)> = (0..THREADS as usize)
+        .map(|t| match t {
+            0 => (true, 0u64 | 5, ray_hit),            // box32 at offset 0
+            1 => (true, (128u64 >> 3) | 0, ray_hit),   // triangle at offset 128
+            2 => (true, (128u64 >> 3) | 0, ray_miss),  // triangle miss
+            _ => (false, 0, ray_miss),
+        })
+        .collect();
+    let records = directory_records(&entries);
+
+    // Build a 32-bit `image_bvh_intersect_ray` program with a custom descriptor preamble in s[24:27].
+    let make_prog = |preamble: &[u32]| -> NativeProgram {
+        let mut w = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (records SRV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (output UAV)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x3428_0086, // v_lshlrev_b32 v20, 6, v0 (tid * 64)
+            0x342A_0084, // v_lshlrev_b32 v21, 4, v0 (tid * 16)
+            0xE038_1000,
+            0x8002_0114, // buffer_load_dwordx4 v[1:4], v20, s[8:11], 0 offen
+            0xE038_1010,
+            0x8002_0514, // buffer_load_dwordx4 v[5:8], v20, s[8:11], 0 offen offset:16
+            0xE038_1020,
+            0x8002_0914, // buffer_load_dwordx4 v[9:12], v20, s[8:11], 0 offen offset:32
+            0xE030_1030,
+            0x8002_1114, // buffer_load_dword v17, v20, s[8:11], 0 offen offset:48 (active)
+            0xBF8C_0F70, // s_waitcnt vmcnt(0)
+            0x7E1A_0281, // v13 = 1
+            0x7E1C_0282, // v14 = 2
+            0x7E1E_0283, // v15 = 3
+            0x7E20_0284, // v16 = 4
+        ];
+        w.extend_from_slice(preamble);
+        w.extend_from_slice(&[
+            0xBE94_037E, // s_mov_b32 s20, exec_lo
+            0x7DAA_2280, // v_cmpx_ne_u32 exec_lo, 0, v17
+            // image_bvh_intersect_ray v[13:16], [v1, v3..v12], s[24:27]
+            0xF198_9F07,
+            0x0006_0D01,
+            0x0605_0403,
+            0x0A09_0807,
+            0x0000_0C0B,
+            0xBF8C_0F70, // s_waitcnt vmcnt(0)
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0xE078_1000,
+            0x8003_0D15, // buffer_store_dwordx4 v[13:16], v21, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        native(&w)
+    };
+
+    // Case A: dynamic word0 = s0, dynamic word1 = s1 | BOX_SORT -> box_sort == Some(true)
+    let prog_static_sort = make_prog(&[
+        0xBE98_0300, // s_mov_b32 s24, s0
+        0x8819_FF01,
+        bvh::BOX_SORT, // s_or_b32 s25, s1, BOX_SORT
+        0xBE9A_03C1,   // s_mov_b32 s26, -1
+        0xBE9B_03FF,
+        0x8900_03FF, // s_mov_b32 s27, 0x890003ff
+    ]);
+    let (shader_a, res_a) = build_compute_shader(&prog_static_sort).expect("Case A lowers");
+    assert_eq!(
+        res_a.bvh[0].1,
+        BvhNodes::Memory {
+            box_sort: Some(true),
+            word3: 0x8900_03ff,
+        }
+    );
+
+    // Case B: fully dynamic word0 = s0, word1 = s1 -> box_sort == None (runtime BOX_SORT)
+    let prog_dyn_sort = make_prog(&[
+        0xBE98_0300, // s_mov_b32 s24, s0
+        0xBE99_0301, // s_mov_b32 s25, s1
+        0xBE9A_03C1, // s_mov_b32 s26, -1
+        0xBE9B_03FF,
+        0x8900_03FF, // s_mov_b32 s27, 0x890003ff
+    ]);
+    let (shader_b, res_b) = build_compute_shader(&prog_dyn_sort).expect("Case B lowers");
+    assert_eq!(
+        res_b.bvh[0].1,
+        BvhNodes::Memory {
+            box_sort: None,
+            word3: 0x8900_03ff,
+        }
+    );
+
+    // Case C: picked heap view at index s0 -> reads 64-bit address from SLOT_STRIDES / VIEW_ADDRESSES
+    // and shifts right by 8 bits into (s24, s25 | BOX_SORT).
+    let prog_picked = make_prog(&[
+        0x8F06_8500, // s_lshl_b32 s6, s0, 5 (slot * 32)
+        0xF408_0502,
+        0x0C00_0000, // s_load_dwordx4 s[20:23], s[4:5], s6 (picked descriptor -> VIEW_ADDRESSES)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        // word0 = (addr_lo >> 8) | (addr_hi << 24)
+        0x9018_8814, // s_lshr_b32 s24, s20, 8
+        0x8F19_9815, // s_lshl_b32 s25, s21, 24
+        0x8818_1918, // s_or_b32 s24, s24, s25
+        // word1 = ((addr_hi >> 8) & 0xff) | BOX_SORT
+        0x9019_8815, // s_lshr_b32 s25, s21, 8
+        0x8719_FF19,
+        0x0000_00FF, // s_and_b32 s25, s25, 0xff
+        0x8819_FF19,
+        bvh::BOX_SORT, // s_or_b32 s25, s25, BOX_SORT
+        0xBE9A_03C1,   // s_mov_b32 s26, -1
+        0xBE9B_03FF,
+        0x8900_03FF, // s_mov_b32 s27, 0x890003ff
+    ]);
+    let (shader_c, res_c) = build_compute_shader(&prog_picked).expect("Case C lowers");
+    assert!(shader_c.root_srvs.contains(&SLOT_STRIDES));
+    assert_eq!(
+        res_c.bvh[0].1,
+        BvhNodes::Memory {
+            box_sort: Some(true),
+            word3: 0x8900_03ff,
+        }
+    );
+
+    let want_box_sorted = bvh::intersect(&box_node, 5, &ray_hit, true);
+    let want_box_unsorted = bvh::intersect(&box_node, 5, &ray_hit, false);
+    assert_ne!(want_box_sorted, want_box_unsorted);
+    let want_tri_hit = bvh::intersect(&tri_node, 0, &ray_hit, true);
+    let want_tri_miss = bvh::intersect(&tri_node, 0, &ray_miss, true);
+
+    let mut strides_table = vec![0u32; SLOT_STRIDES_BYTES as usize / 4];
+    let va_at = VIEW_ADDRESSES as usize / 4;
+    // Slot 2 holds BASE_ADDR; slot 0 holds a decoy.
+    strides_table[va_at..va_at + 2].copy_from_slice(&[0xdead_0000, 0xdd]);
+    strides_table[va_at + 4..va_at + 6]
+        .copy_from_slice(&[BASE_ADDR as u32, (BASE_ADDR >> 32) as u32]);
+
+    let word0 = (BASE_ADDR >> 8) as u32;
+    let word1_hi = (BASE_ADDR >> 40) as u32;
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (dev_label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        if !warp {
+            eprintln!("dynamic_bvh_descriptor adapter: {:?}", host.adapter_name());
+        }
+        // Check Cases A (static sort), B (dynamic sort=false and sort=true), and C (picked view).
+        let run_case = |label: &str, shader: &HostShader, s0_s3: [u32; 4], with_strides: bool, sorted: bool| {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}/{dev_label}: compute_pipeline failed: {e}"));
+            let mut roots = vec![(0, Root::Constants(user_data_constants(shader, s0_s3, 0, 3, 0)))];
+            let mut root_views: Vec<(u8, u8)> = shader
+                .root_cbvs
+                .iter()
+                .map(|&r| (r, 0))
+                .chain(shader.root_srvs.iter().map(|&r| (r, 1)))
+                .chain(shader.root_uavs.iter().map(|&r| (r, 2)))
+                .collect();
+            root_views.sort_unstable();
+            root_views.dedup();
+            let mut fault_out_idx = 0usize;
+            for (param_idx, (slot, kind)) in root_views.into_iter().enumerate() {
+                let idx = (param_idx + 1) as u32;
+                match (slot, kind) {
+                    (s, 2) if s == super::SLOT_FAULTS => {
+                        fault_out_idx = 1;
+                        roots.push((idx, Root::Uav(super::MEMORY_FAULTS)));
+                    }
+                    (s, 1) if s == super::SLOT_MEMORY => {
+                        roots.push((idx, Root::DeviceSrv(directory.clone())));
+                    }
+                    (s, 1) if with_strides && s == SLOT_STRIDES => {
+                        roots.push((idx, Root::View { srv: true, data: strides_table.clone() }));
+                    }
+                    other => panic!("{label}: unexpected root view {other:?}"),
+                }
+            }
+            let decoy = [0u32; 4];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &[
+                            View::DeviceRawSrv(&records),
+                            View::RawUav(4 * THREADS),
+                            View::Buffer { data: &decoy, stride: Stride::Raw }, // slot 2: picked view
+                            View::NullRawUav,                                   // memory_base + 0
+                            View::RawUavData(&arena),                           // memory_base + 1 (copy 1)
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}/{dev_label}: dispatch failed: {e}"));
+            let want_box = if sorted { want_box_sorted } else { want_box_unsorted };
+            assert_eq!(&out[0][0..4], &want_box, "{label}/{dev_label} thread 0 (box)");
+            assert_eq!(&out[0][4..8], &want_tri_hit, "{label}/{dev_label} thread 1 (tri hit)");
+            assert_eq!(&out[0][8..12], &want_tri_miss, "{label}/{dev_label} thread 2 (tri miss)");
+            assert_eq!(&out[0][12..16], &BEFORE, "{label}/{dev_label} thread 3 (masked)");
+            assert!(
+                faulted_pages(&out[fault_out_idx]).is_empty(),
+                "{label}/{dev_label} unexpected faults: {:?}",
+                faulted_pages(&out[fault_out_idx])
+            );
+        };
+
+        run_case("static_or_sort", &shader_a, [word0, word1_hi, 0, 0], false, true);
+        run_case("dyn_sort_off", &shader_b, [word0, word1_hi, 0, 0], false, false);
+        run_case("dyn_sort_on", &shader_b, [word0, word1_hi | bvh::BOX_SORT, 0, 0], false, true);
+        run_case("picked_view", &shader_c, [2, 0, 0, 0], true, true);
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// Tests `image_bvh64_intersect_ray` with partial `dmask` values (`0x3`, `0x5`,
+/// `0x1`): only the requested channels are written packed into `v[dst..]`, and
+/// unwritten VGPRs keep their pre-existing sentinel values (`BEFORE`).
+#[test]
+fn partial_dmask_bvh_intersect_writes_only_requested_channels_on_gpu() {
+    const PAGE_BYTES: usize = 1 << 16;
+    const BASE_PAGE: u32 = 0x100;
+    const BASE_ADDR: u64 = (BASE_PAGE as u64) << 16;
+
+    let box_node = nodes::box32(
+        [0x105, 0x20c, 0x304, bvh::NONE],
+        [
+            [29.0, -1.0, -1.0, 31.0, 1.0, 1.0],
+            [9.0, -1.0, -1.0, 11.0, 1.0, 1.0],
+            [19.0, -1.0, -1.0, 21.0, 1.0, 1.0],
+            [f32::NAN; 6],
+        ],
+    );
+    let tri_node = nodes::triangles(&[[5.0, 0.0, 2.0], [5.0, 2.0, -2.0], [5.0, -2.0, -2.0]], 9);
+
+    let mut arena = vec![0u32; PAGE_BYTES / 4];
+    arena[..28].copy_from_slice(&box_node);
+    arena[32..48].copy_from_slice(&tri_node[..16]);
+    let directory = make_directory(super::MEMORY_PAGES, &[(BASE_PAGE, 1, 0, false)]);
+
+    let ray_hit = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+    let ray_miss = Ray::new([0.0, 5.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+    let entries: Vec<(bool, u64, Ray)> = (0..THREADS as usize)
+        .map(|t| match t {
+            0 => (true, (BASE_ADDR >> 3) | 5, ray_hit),
+            1 => (true, ((BASE_ADDR + 128) >> 3) | 0, ray_hit),
+            2 => (true, ((BASE_ADDR + 128) >> 3) | 0, ray_miss),
+            _ => (false, 0, ray_miss),
+        })
+        .collect();
+    let records = directory_records(&entries);
+    let full_want = [
+        bvh::intersect(&box_node, 5, &ray_hit, true),
+        bvh::intersect(&tri_node, 0, &ray_hit, true),
+        bvh::intersect(&tri_node, 0, &ray_miss, true),
+    ];
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for dmask in [0x3u8, 0x5, 0x1] {
+        let mut w = program(true, WHOLE);
+        let bvh_pos = w.iter().position(|&x| x == 0xF19C_9F07).unwrap();
+        w[bvh_pos] = 0xF19C_9007 | (u32::from(dmask) << 8);
+        let (shader, _) = build_compute_shader(&native(&w))
+            .unwrap_or_else(|e| panic!("dmask=0x{dmask:x} failed to lower: {e}"));
+
+        let mut ran = 0;
+        for (dev_label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            if !warp && dmask == 0x3 {
+                eprintln!("partial_dmask adapter: {:?}", host.adapter_name());
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("dmask=0x{dmask:x}/{dev_label}: pipeline: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(user_data_constants(&shader, [0; 4], 0, 2, 0))),
+                            (1, Root::Uav(super::MEMORY_FAULTS)),
+                            (2, Root::DeviceSrv(directory.clone())),
+                        ],
+                        views: &[
+                            View::DeviceRawSrv(&records),
+                            View::RawUav(4 * THREADS),
+                            View::NullRawUav,
+                            View::RawUavData(&arena),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dmask=0x{dmask:x}/{dev_label}: dispatch: {e}"));
+            for (t, full) in full_want.iter().enumerate() {
+                let mut want = BEFORE;
+                let mut dst_k = 0usize;
+                for (chan, &val) in full.iter().enumerate() {
+                    if (dmask >> chan) & 1 != 0 {
+                        want[dst_k] = val;
+                        dst_k += 1;
+                    }
+                }
+                assert_eq!(
+                    &out[0][4 * t..4 * t + 4],
+                    &want,
+                    "dmask=0x{dmask:x}/{dev_label} thread {t}"
+                );
+            }
+            assert_eq!(&out[0][12..16], &BEFORE, "dmask=0x{dmask:x}/{dev_label} masked thread");
+            assert!(faulted_pages(&out[1]).is_empty());
+            ran += 1;
+        }
+        assert!(ran > 0, "no SM 6.6 device available");
+    }
+}
+
+/// Addresses at or above 2^40 bytes (1 TiB, e.g. `hi = 0x100` or `0x300`) must
+/// clamp to the unmapped sentinel `MEMORY_PAGES - 1` instead of wrapping via
+/// `hi & 0xff` onto mapped low pages in `SLOT_MEMORY`.
+#[test]
+fn directory_clamps_addresses_at_or_above_one_tib_without_aliasing() {
+    const PAGE_BYTES: usize = 1 << 16;
+    const MAPPED_PAGE: u32 = 0x100;
+    const MAPPED_ADDR: u64 = (MAPPED_PAGE as u64) << 16;
+    const ONE_TIB: u64 = 1u64 << 40;
+
+    let tri_node = nodes::triangles(&[[5.0, 0.0, 2.0], [5.0, 2.0, -2.0], [5.0, -2.0, -2.0]], 9);
+    let box_node = nodes::box32(
+        [0x200, 0x300, bvh::NONE, bvh::NONE],
+        [
+            [9.0, -1.0, -1.0, 11.0, 1.0, 1.0],
+            [19.0, -1.0, -1.0, 21.0, 1.0, 1.0],
+            [f32::NAN; 6],
+            [f32::NAN; 6],
+        ],
+    );
+    let mut arena = vec![0u32; PAGE_BYTES / 4];
+    arena[..16].copy_from_slice(&tri_node[..16]);
+    arena[32..60].copy_from_slice(&box_node);
+    let directory = make_directory(super::MEMORY_PAGES, &[(MAPPED_PAGE, 1, 0, false)]);
+
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+    let want_tri_hit = bvh::intersect(&tri_node, 0, &ray, true);
+    let want_box_hit = bvh::intersect(&box_node, 5, &ray, true);
+    let want_miss = bvh::MISS.map(f32::to_bits);
+
+    let entries: Vec<(bool, u64, Ray)> = (0..THREADS as usize)
+        .map(|t| match t {
+            // Mapped low addresses: must hit.
+            0 => (true, (MAPPED_ADDR >> 3) | 0, ray),
+            1 => (true, ((MAPPED_ADDR + 128) >> 3) | 5, ray),
+            // Same low 40 bits + 1 TiB (`hi = 0x100`): must NOT alias page 0x100!
+            2 => (true, ((ONE_TIB + MAPPED_ADDR) >> 3) | 0, ray),
+            3 => (true, ((ONE_TIB + MAPPED_ADDR + 128) >> 3) | 5, ray),
+            // Same low 40 bits + 3 TiB (`hi = 0x300`): must NOT alias page 0x100!
+            4 => (true, ((3 * ONE_TIB + MAPPED_ADDR) >> 3) | 0, ray),
+            _ => (false, 0, ray),
+        })
+        .collect();
+    let records = directory_records(&entries);
+    let (shader, _) = build_compute_shader(&native(&program(true, WHOLE))).expect("lowers");
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (dev_label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        if !warp {
+            eprintln!("one_tib_clamp adapter: {:?}", host.adapter_name());
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{dev_label}: compute_pipeline: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(user_data_constants(&shader, [0; 4], 0, 2, 0))),
+                        (1, Root::Uav(super::MEMORY_FAULTS)),
+                        (2, Root::DeviceSrv(directory.clone())),
+                    ],
+                    views: &[
+                        View::DeviceRawSrv(&records),
+                        View::RawUav(4 * THREADS),
+                        View::NullRawUav,
+                        View::RawUavData(&arena),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{dev_label}: dispatch: {e}"));
+        assert_eq!(&out[0][0..4], &want_tri_hit, "{dev_label} thread 0 (mapped tri)");
+        assert_eq!(&out[0][4..8], &want_box_hit, "{dev_label} thread 1 (mapped box)");
+        assert_eq!(&out[0][8..12], &want_miss, "{dev_label} thread 2 (1 TiB tri must miss)");
+        assert_eq!(&out[0][12..16], &[bvh::NONE; 4], "{dev_label} thread 3 (1 TiB box must miss)");
+        assert_eq!(&out[0][16..20], &want_miss, "{dev_label} thread 4 (3 TiB tri must miss)");
+        assert_eq!(
+            faulted_pages(&out[1]),
+            vec![super::MEMORY_PAGES - 1],
+            "{dev_label}: >=1 TiB addresses must clamp to MEMORY_PAGES - 1"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }

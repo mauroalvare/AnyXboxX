@@ -154,10 +154,22 @@ fn build() -> [u8; 32] {
         }
         bytes
     });
+    build_fingerprint(
+        fixed,
+        victory_shader::emit::host_settings(),
+        victory_shader::emit::lane_private_lds_enabled(),
+    )
+}
+
+fn build_fingerprint(fixed: &[u8], host_settings: [u32; 4], lane_private_lds: bool) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
+    for value in host_settings {
         hash.update(&value.to_le_bytes());
+    }
+    if lane_private_lds {
+        // Leave existing default-mode entries usable.
+        hash.update(b"VICTORY_LDS_PRIVATE=1\0");
     }
     *hash.finalize().as_bytes()
 }
@@ -537,6 +549,20 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn lane_private_lds_has_a_distinct_cache_key() {
+        let fixed = b"translator settings";
+        let host = [32u32, 1, 2, 3];
+        let mut legacy = blake3::Hasher::new();
+        legacy.update(fixed);
+        for value in host {
+            legacy.update(&value.to_le_bytes());
+        }
+        let baseline = build_fingerprint(fixed, host, false);
+        assert_eq!(baseline, *legacy.finalize().as_bytes());
+        assert_ne!(build_fingerprint(fixed, host, true), baseline);
     }
 
     #[test]
