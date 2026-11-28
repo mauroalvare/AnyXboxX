@@ -123,6 +123,10 @@ fn faults_all() -> usize {
 }
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// Maximum gap (in 64 KiB pages) and span when coalescing nearby pages into a
+/// single `watch::writes` query.
+const WATCH_GAP: u64 = 64;
+const WATCH_SPAN: u64 = 1024;
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -157,6 +161,8 @@ struct Packed {
     len: u64,
     /// Its first two dwords in title memory.
     header: u64,
+    /// The write-watch asking at which `header` was last confirmed (0: never).
+    checked: u64,
 }
 
 /// One 64 MiB arena and its per-page free bitmap.
@@ -319,6 +325,9 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Reusable scratch buffers for coalesced write-watch queries.
+    scratch_pages: Vec<u64>,
+    scratch_watch: Vec<(u64, Option<(u64, u64)>)>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -404,6 +413,8 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            scratch_pages: Vec::new(),
+            scratch_watch: Vec::new(),
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -455,6 +466,15 @@ impl Memory {
         // stays empty.
         if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
             return false;
+        }
+        // Pages already mapped in the directory (matching `map()`'s early
+        // return) skip redundant `VirtualQuery` + `GetWriteWatch` revalidation
+        // during dispatch recording: `bring_pages()` reads via SEH-safe
+        // `copy_mapped`, `land()` validates `committed()` on any dirty/unknown
+        // header, and `look_again()` still calls `there()` (which checks
+        // `committed()`) so pages decommitted without a write are reclaimed.
+        if self.copy_of(page).is_some() {
+            return true;
         }
         let at = (page * PAGE) as usize;
         let ours = crate::texture::committed(at as *const u8, PAGE as usize)
@@ -782,11 +802,13 @@ impl Memory {
 
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
+        let mut pages = std::mem::take(&mut self.scratch_pages);
+        pages.clear();
         for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
             let page = self.order[self.sweep];
             if self.pages.contains_key(&page) {
-                self.bring(page, page + 1);
+                pages.push(page);
             } else {
                 self.order.swap_remove(self.sweep);
                 if self.order.is_empty() {
@@ -794,6 +816,13 @@ impl Memory {
                 }
             }
         }
+        self.scratch_pages = self.bring_pages(pages);
+
+        // Keep `there()` (`VirtualQuery` + header check) on the slow `SWEEP`
+        // cadence (~1/128 packed entries per frame) so a packed page
+        // decommitted with `VirtualFree(..., MEM_DECOMMIT)` without any CPU
+        // write (which `GetWriteWatch` does not report as dirty on a still-
+        // reserved `MEM_WRITE_WATCH` VAD) is still detected and reclaimed.
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
             self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
             let address = self.packed_order[self.packed_sweep];
@@ -841,102 +870,102 @@ impl Memory {
     }
 
     /// [`Memory::map`] of the pages of `[address, address + len)`, up to the
-    /// first that is not the title's, and what the title wrote there since
-    /// they were taken goes into the arenas.
-    fn ready(&mut self, address: u64, len: u64) {
+    /// first that is not the title's, pushing any arena pages not yet checked
+    /// this frame into `pending` for a single coalesced [`Memory::bring_pages`].
+    fn map_range(&mut self, address: u64, len: u64, pending: &mut Vec<u64>) {
+        if len == 0 {
+            return;
+        }
         let first = address / PAGE;
         let last = (address + len.saturating_sub(1)) / PAGE;
         let end = self.map_contiguous(first, last, false);
-        self.bring(first, end);
+        let frame = self.frame;
+        pending.extend((first..end).filter(|page| self.pages.get(page).is_some_and(|h| h.looked != frame)));
     }
 
-    /// Takes the pages `[first, end)` that are in arenas from title memory
-    /// where it wrote them, directly into the arena's staging memory and
-    /// marking only exact changed byte runs dirty on the card.
-    fn bring(&mut self, first: u64, end: u64) {
-        // Once a frame: the builder names the same pages list after list.
+    /// Takes the arena pages in `pages` from title memory where it wrote them,
+    /// sorting, deduplicating, and coalescing nearby pages into batched
+    /// `watch::writes` queries.
+    fn bring_pages(&mut self, mut pages: Vec<u64>) -> Vec<u64> {
+        if pages.is_empty() {
+            return pages;
+        }
+        pages.sort_unstable();
+        pages.dedup();
         let frame = self.frame;
-        if !(first..end).any(|page| self.pages.get(&page).is_some_and(|h| h.looked != frame)) {
-            return;
+        pages.retain(|page| self.pages.get(page).is_some_and(|h| h.looked != frame));
+        if pages.is_empty() {
+            return pages;
         }
         let started = std::time::Instant::now();
-        let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
-        let now = answer.as_ref().map_or(1, |a| a.0);
-        // Collect stale pages first so 4 KiB sub-page dirty masks can be
-        // queried in one batch for previously taken pages.
-        let mut fresh_pages: Vec<(u64, usize, usize)> = Vec::new();
-        let mut prev_pages: Vec<(u64, usize, usize, u64)> = Vec::new();
-        for page in first..end {
+        let mut watch = std::mem::take(&mut self.scratch_watch);
+        query_page_writes(&pages, &mut watch);
+        let mut stale_pages = Vec::new();
+        let mut part_queries = Vec::new();
+        for &(page, answer) in &watch {
             let Some(held) = self.pages.get_mut(&page) else {
                 continue;
             };
-            if held.looked == frame {
-                continue;
-            }
             held.looked = frame;
             self.stats.looked += 1;
-            let wrote = answer
-                .as_ref()
-                .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
-            let stale = held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
-            if !stale {
+            let prev = held.taken;
+            if prev != 0 && answer.is_some_and(|(_, wrote)| wrote <= prev) {
                 continue;
             }
-            let prev = std::mem::replace(&mut held.taken, now.max(1));
-            if prev == 0 {
-                fresh_pages.push((page, held.copy, held.offset));
+            held.taken = answer.map_or(1, |(now, _)| now.max(1));
+            let parts = if prev != 0 && answer.is_some() {
+                let index = part_queries.len();
+                part_queries.push((page as usize, prev));
+                Some(index)
             } else {
-                prev_pages.push((page, held.copy, held.offset, prev));
-            }
-        }
-        let mut title = [0u8; PIECE];
-        for (page, copy, offset) in fresh_pages {
-            let shadow = &self.copies[copy];
-            let data = shadow.data_mut();
-            for piece in (0..PAGE as usize).step_by(PIECE) {
-                let from = (page * PAGE) as usize + piece;
-                // (Pages that are not there read as zeros.)
-                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
-                // SAFETY: inside the arena's L0 WRITE_BACK staging mapping, under the mutex.
-                let ours = unsafe { std::slice::from_raw_parts_mut(data.add(offset + piece), PIECE) };
-                ours.copy_from_slice(&title);
-            }
-            shadow.mark_card_dirty(offset, offset + PAGE as usize);
-            self.stats.changed += PAGE;
-        }
-        if !prev_pages.is_empty() {
-            let masks: Vec<u16> = if answer.is_some() {
-                let query: Vec<(usize, u64)> = prev_pages.iter().map(|&(p, _, _, t)| (p as usize, t)).collect();
-                crate::watch::parts_written(&query)
-            } else {
-                vec![u16::MAX; prev_pages.len()]
+                None
             };
-            for (&(page, copy, offset, _), &mask) in prev_pages.iter().zip(&masks) {
-                if mask == 0 {
-                    continue;
-                }
-                let shadow = &self.copies[copy];
-                let data = shadow.data_mut();
-                let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
-                for k in (0..16).filter(|k| (mask >> k) & 1 != 0) {
-                    let piece = k * PIECE;
-                    let from = (page * PAGE) as usize + piece;
-                    crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
-                    // SAFETY: inside the arena's L0 WRITE_BACK staging mapping, under the mutex.
-                    let ours = unsafe { std::slice::from_raw_parts_mut(data.add(offset + piece), PIECE) };
-                    let runs = crate::shadow::word_diff_runs(piece, &title, ours);
-                    for &(a, len) in &runs {
-                        ours[a..a + len].copy_from_slice(&title[a..a + len]);
+            stale_pages.push((page, prev == 0, parts));
+        }
+
+        let masks = if part_queries.is_empty() {
+            Vec::new()
+        } else {
+            crate::watch::parts_written(&part_queries)
+        };
+        let mut title = [0u8; PIECE];
+        for (page, fresh, parts) in stale_pages {
+            let mask = parts.map_or(u16::MAX, |i| masks[i]);
+            if mask == 0 {
+                continue;
+            }
+            let held = &self.pages[&page];
+            let shadow = &self.copies[held.copy];
+            let data = shadow.data_mut();
+            let offset = held.offset;
+            let mut dirty = Vec::new();
+            for piece in (0..16).filter(|i| (mask >> i) & 1 != 0).map(|i| i * PIECE) {
+                let from = (page * PAGE) as usize + piece;
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
+                // SAFETY: inside the arena staging mapping, under the memory mutex.
+                let ours = unsafe { std::slice::from_raw_parts_mut(data.add(offset + piece), PIECE) };
+                if fresh {
+                    ours.copy_from_slice(&title);
+                } else {
+                    for (at, len) in crate::shadow::word_diff_runs(piece, &title, ours) {
+                        ours[at..at + len].copy_from_slice(&title[at..at + len]);
                         self.stats.changed += len as u64;
-                        dirty_runs.push((offset + piece + a, offset + piece + a + len));
+                        dirty.push((offset + piece + at, offset + piece + at + len));
                     }
                 }
-                if !dirty_runs.is_empty() {
-                    shadow.mark_card_dirty_runs(dirty_runs.into_iter());
-                }
+            }
+            if fresh {
+                shadow.mark_card_dirty(offset, offset + PAGE as usize);
+                self.stats.changed += PAGE;
+            } else if !dirty.is_empty() {
+                shadow.mark_card_dirty_runs(dirty.into_iter());
             }
         }
+        watch.clear();
+        self.scratch_watch = watch;
         self.stats.micros += started.elapsed().as_micros() as u64;
+        pages.clear();
+        pages
     }
 
     /// The bytes of a packed structure title memory has at `address` by now,
@@ -951,12 +980,48 @@ impl Memory {
         Some((packed_len(header)?, header))
     }
 
+    /// Batched submission-time [`Memory::land`] for all builder addresses of a
+    /// dispatch: checks header pages with coalesced write-watch queries so
+    /// unchanged known packed structures within [`AGAIN`] skip `VirtualQuery`
+    /// and `copy_mapped` completely, while any written or replaced header runs
+    /// the full `land` path.
+    fn land_batch(&mut self, addrs: &[u64]) {
+        let mut header_pages = std::mem::take(&mut self.scratch_pages);
+        header_pages.clear();
+        header_pages.extend(addrs.iter().map(|&a| a / PAGE));
+        header_pages.sort_unstable();
+        header_pages.dedup();
+        let mut watch = std::mem::take(&mut self.scratch_watch);
+        query_page_writes(&header_pages, &mut watch);
+        header_pages.clear();
+        self.scratch_pages = header_pages;
+
+        for &address in addrs {
+            let answer = lookup_watch(&watch, address / PAGE);
+            if let Some((now, wrote)) = answer
+                && let Some(known) = self.packed.get_mut(&address)
+                && known.frame + AGAIN >= self.frame
+                && known.checked != 0
+                && wrote <= known.checked
+            {
+                known.frame = self.frame;
+                known.checked = now;
+                continue;
+            }
+            self.land(address, answer.map_or(0, |(now, _)| now));
+        }
+
+        watch.clear();
+        self.scratch_watch = watch;
+    }
+
     /// At the submission of a list whose builder dispatch was given `address`
     /// outside buffers, in the order of its copies: what title memory has
-    /// there now goes up directly into staging + card dirty list. When the
-    /// dispatch is recorded it may not be there yet: the title's queue waits
-    /// for its streaming.
-    fn land(&mut self, address: u64) {
+    /// there now goes up. When the dispatch is recorded it may not be there
+    /// yet: the title's queue waits for its streaming. `asking` is the
+    /// write-watch asking taken immediately before reading `address` (0 if
+    /// unwatched).
+    fn land(&mut self, address: u64, asking: u64) {
         let page = address / PAGE;
         if !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize) {
             return;
@@ -974,15 +1039,18 @@ impl Memory {
             let soon = known.frame + AGAIN >= self.frame;
             known.frame = self.frame;
             if known.header == header && soon {
+                known.checked = asking;
                 return;
             }
             if known.header != header {
                 self.gone(address);
+            } else {
+                known.checked = asking;
             }
         }
         let last = (address + len - 1) / PAGE;
         if !self.packed.contains_key(&address) {
-            self.packed.insert(address, Packed { frame: self.frame, len, header });
+            self.packed.insert(address, Packed { frame: self.frame, len, header, checked: asking });
             self.packed_order.push(address);
             self.place_packed_pages(page, last);
             for p in page..=last {
@@ -1139,8 +1207,11 @@ impl Memory {
             return;
         }
         pages.sort_unstable();
+        pages.dedup();
         let mut made = 0;
         let all = faults_all();
+        let mut bring = std::mem::take(&mut self.scratch_pages);
+        bring.clear();
         for &page in &pages {
             self.stats.distinct.insert(page);
             if self.copy_of(page).is_some() {
@@ -1150,12 +1221,13 @@ impl Memory {
                 if self.map(page) {
                     made += 1;
                     self.faulted += 1;
-                    self.bring(page, page + 1);
+                    bring.push(page);
                 }
             } else {
                 self.stats.left += 1;
             }
         }
+        self.scratch_pages = self.bring_pages(bring);
         self.stats.faults += pages.len() as u64;
         // The first frames that leave pages without a copy: all of them, and
         // which of them hold a packed structure's first bytes or lie in a
@@ -1194,19 +1266,29 @@ impl Memory {
 
     /// The structures named in a list's upload memory around `address`
     /// (instances of a top-level build: a structure's address is their last
-    /// 8 bytes): the first page of each.
-    fn named_in_upload(&mut self, address: u64) {
+    /// 8 bytes): the first page of each, queued into `pending` for coalesced
+    /// [`Memory::bring_pages`].
+    fn named_in_upload(&mut self, address: u64, pending: &mut Vec<u64>) {
         let Some((from, len)) = crate::upload::block(address as usize) else {
             return;
         };
         // SAFETY: the block is handed out and stays mapped; the title wrote
         // it before it recorded the dispatch.
         let words = unsafe { std::slice::from_raw_parts(from as *const u64, len / 8) };
-        let mut seen = std::collections::HashSet::new();
+        let frame = self.frame;
+        let mut last_page = u64::MAX;
         for &word in words {
-            if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
+            if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) {
                 let page = word / PAGE;
-                self.bring(page, page + 1);
+                if page == last_page {
+                    continue;
+                }
+                last_page = page;
+                if self.copy_of(page).is_some() || self.map(page) {
+                    if self.pages.get(&page).is_some_and(|h| h.looked != frame) {
+                        pending.push(page);
+                    }
+                }
             }
         }
     }
@@ -1371,6 +1453,72 @@ fn packed_len(header: u64) -> Option<u64> {
     (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
 }
 
+/// Queries write-watch state for sorted, deduplicated 64 KiB `pages`,
+/// coalescing nearby pages (within [`WATCH_GAP`] pages and [`WATCH_SPAN`] total
+/// span) into batched `watch::writes` calls. Results are written to `out` in
+/// the same sorted page order as `(page, Some((now, wrote)))` or `(page, None)`.
+fn query_page_writes(pages: &[u64], out: &mut Vec<(u64, Option<(u64, u64)>)>) {
+    out.clear();
+    out.reserve(pages.len());
+    let mut i = 0;
+    while i < pages.len() {
+        let start_page = pages[i];
+        let mut j = i + 1;
+        while j < pages.len()
+            && pages[j] - pages[j - 1] <= WATCH_GAP
+            && pages[j] - start_page < WATCH_SPAN
+        {
+            j += 1;
+        }
+        query_cluster(&pages[i..j], out);
+        i = j;
+    }
+}
+
+/// Queries one sorted cluster of pages with a single `watch::writes` call,
+/// splitting by halves if the span crosses separate `VirtualAlloc` reservations
+/// or unwatched holes.
+fn query_cluster(chunk: &[u64], out: &mut Vec<(u64, Option<(u64, u64)>)>) {
+    if chunk.is_empty() {
+        return;
+    }
+    let first = chunk[0];
+    let end = chunk[chunk.len() - 1] + 1;
+    let contiguous = end - first == chunk.len() as u64;
+    // Only pass `guarded = true` when there are no gaps between pages, so we
+    // never guard unrelated memory in a gap.
+    match crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, contiguous) {
+        Some((now, written)) => {
+            let mut wi = 0;
+            for &page in chunk {
+                let p = page as usize;
+                while wi < written.len() && written[wi].0 < p {
+                    wi += 1;
+                }
+                let wrote = if wi < written.len() && written[wi].0 == p {
+                    written[wi].1
+                } else {
+                    0
+                };
+                out.push((page, Some((now, wrote))));
+            }
+        }
+        None if chunk.len() > 1 => {
+            let mid = chunk.len() / 2;
+            query_cluster(&chunk[..mid], out);
+            query_cluster(&chunk[mid..], out);
+        }
+        None => {
+            out.push((first, None));
+        }
+    }
+}
+
+/// Binary-search lookup in the sorted output of [`query_page_writes`].
+fn lookup_watch(watch: &[(u64, Option<(u64, u64)>)], page: u64) -> Option<(u64, u64)> {
+    watch.binary_search_by_key(&page, |&(p, _)| p).ok().and_then(|i| watch[i].1)
+}
+
 /// Puts what `title` holds into `ours` (what was last taken): the dwords that
 /// differ. How many.
 #[cfg(test)]
@@ -1443,6 +1591,9 @@ pub(crate) fn ready(
     // looks like one names memory nothing reads; one that is not the title's
     // memory is refused.
     let held = |m: &Memory| m.pages.len() as u64;
+    let mut pending = std::mem::take(&mut m.scratch_pages);
+    pending.clear();
+    let mut land_addrs: Vec<u64> = Vec::new();
     let before = held(m);
     for (i, &c) in constants.iter().enumerate() {
         if let Some(&high) = constants.get(i + 1)
@@ -1451,13 +1602,13 @@ pub(crate) fn ready(
         {
             let at = u64::from(c) | u64::from(high) << 32;
             if named(1, at) {
-                m.ready(at, 1);
+                m.map_range(at, 1, &mut pending);
             }
         }
         if builds && (0x0100_0000..0x2000_0000).contains(&c) {
             let at = u64::from(c) << 8;
             if named(1, at) {
-                m.ready(at, 1);
+                m.map_range(at, 1, &mut pending);
             }
         }
     }
@@ -1470,20 +1621,22 @@ pub(crate) fn ready(
             && crate::shadow::in_buffer(at, 1).is_none()
             && m.possible(at / PAGE)
         {
-            // Map the pages now so any new arena is bound in the view heap
-            // before recording ends; `Memory::land` uploads the bytes once at
-            // submission time directly into staging + card dirty list.
-            if let Some((len, _)) = m.packed_at(at) {
+            // Bind the arenas during recording. The batched callback
+            // checks the latest headers and stages bytes at submission.
+            let len = m.packed.get(&at)
+                .filter(|known| known.frame + AGAIN >= frame && known.checked != 0)
+                .map(|known| known.len)
+                .or_else(|| m.packed_at(at).map(|(len, _)| len));
+            if let Some(len) = len {
                 packed = true;
-                let first_page = at / PAGE;
-                let last_page = (at + len - 1) / PAGE;
-                m.map_contiguous(first_page, last_page, true);
+                let first = at / PAGE;
+                let last = (at + len - 1) / PAGE;
+                let end = m.map_contiguous(first, last, true);
+                pending.extend((first..end).filter(|page| {
+                    m.pages.get(page).is_some_and(|h| h.looked != frame)
+                }));
             }
-            list.defer_host(move || {
-                if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                    m.land(at);
-                }
-            });
+            land_addrs.push(at);
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1501,7 +1654,7 @@ pub(crate) fn ready(
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
                 let before = held(m);
-                m.ready(at, BUILT);
+                m.map_range(at, BUILT, &mut pending);
                 came[1] += held(m).saturating_sub(before);
             }
         }
@@ -1511,22 +1664,47 @@ pub(crate) fn ready(
         let before = held(m);
         match crate::shadow::in_buffer(at, 1) {
             Some(_) => {
-                m.ready(at, 1);
-                m.named_in_upload(at);
+                m.map_range(at, 1, &mut pending);
+                m.named_in_upload(at, &mut pending);
                 came[3] += held(m).saturating_sub(before);
             }
             None => {
-                m.ready(at, if builds { VIEW } else { PAGE });
+                m.map_range(at, if builds { VIEW } else { PAGE }, &mut pending);
                 came[2] += held(m).saturating_sub(before);
             }
         }
+    }
+    m.scratch_pages = m.bring_pages(pending);
+    // Ordering invariant: all `addresses` in this `ready()` call belong to the
+    // same dispatch, so no GPU command runs between them. `land_batch` runs
+    // `land()` in recorded `addresses` order for all non-buffer addresses and
+    // is followed immediately by `bring_up(list)` so `directory` + all `copies`
+    // are refreshed before the dispatch. `m.small()` inside the loop only
+    // touches non-arena title-buffer copies (`!pages.contains_key`), disjoint
+    // from the arena pages written by `land_batch`. Across separate dispatches
+    // or copies on the same list, each `ready()` queues its own `defer_host` +
+    // `bring_up` in exact recorded order.
+    if !land_addrs.is_empty() {
+        list.defer_host(move || {
+            if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                m.land_batch(&land_addrs);
+            }
+        });
+        m.bring_up(list);
+        // `m.copies` is held behind `MEMORY` and cannot grow between here and
+        // the `first_use` check below (all `map`/`another`/`opens`/`small`
+        // calls finished in the loop above). Recording the same key avoids a
+        // duplicate `bring_up(list)` for the same `m.copies.len()` on this
+        // dispatch while still firing `bring_up` if a later `ready()` on this
+        // list allocates another copy.
+        let _ = list.first_use(usize::MAX - (6 << 33) - m.copies.len());
     }
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
+    let (base, made, is_new_heap) = match m.heaps.get(&key) {
+        Some(&(base, made)) => (base, made, false),
         None => {
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(COPIES + 1)?;
@@ -1534,14 +1712,17 @@ pub(crate) fn ready(
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
             }
-            (base, 0)
+            (base, 0, true)
         }
     };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    let copies = m.copies.len() as u32;
+    if is_new_heap || made < copies {
+        for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+            let (_, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        m.heaps.insert(key, (base, copies));
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
@@ -1779,6 +1960,10 @@ mod gpu_tests;
 #[cfg(test)]
 #[path = "memory_locality_tests.rs"]
 mod locality_tests;
+
+#[cfg(test)]
+#[path = "memory_prep_tests.rs"]
+mod prep_tests;
 
 #[cfg(test)]
 mod tests {

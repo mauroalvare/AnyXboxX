@@ -7154,6 +7154,30 @@ impl Host {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn run_test_list_sync(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adapter_label(&self) -> String {
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: live device; plain DXGI adapter query.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                return "unknown".into();
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()) else {
+                return "unknown".into();
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                return "unknown".into();
+            };
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            String::from_utf16_lossy(&desc.Description[..end])
+        }
+    }
+
     /// Sends `list`, a closed list of ours (the present's copy), as a
     /// flight ([`late_free_present`]): not waited for, settled with the
     /// others. The caller keeps the list and does not reset it before the
@@ -8307,6 +8331,15 @@ impl HostList {
             .copies
             .iter()
             .filter(|s| matches!(s, Step::Refresh(..)))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_host_count(&self) -> usize {
+        self.deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::Host(..)))
             .count()
     }
 
